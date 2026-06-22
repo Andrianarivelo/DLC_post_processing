@@ -15,8 +15,9 @@ tidy GLM-ready tables. All offline, all local, all in one window.
 
 ![DLC Post-Processing main window](docs/screenshot.png)
 
-*Two mice caught nose-to-nose. Colored skeletons, live behaviour labels, a metric trace, and a
-behaviour gantt, all from the bundled 120-second demo clip.*
+*A real two-mouse recording in the studio: colored skeletons and live behaviour labels burned
+onto the video, a speed trace, a multi-row behaviour gantt, and the social-behaviour panel with
+its summary table, all in one window.*
 
 </div>
 
@@ -55,9 +56,19 @@ glue code:
 
 ## 📸 More views
 
-| Social behaviour detection | What you get |
-| --- | --- |
-| ![Social panel](docs/screenshot_social.png) | Pick the dyad, tick the behaviours you care about, tune thresholds, hit **Detect**, and read the per-behaviour summary table while the gantt fills in below. |
+**Tracking overlay.** Each animal gets its own colored skeleton, with the active behaviours
+printed right on the frame (here: `A to B body`, `B to A body`, `B oriented to A`, `mask contact`,
+`passive investigation`, mobility states) and an optional segmentation-mask contact check.
+
+![Tracking overlay close-up](docs/screenshot_video.png)
+
+**Social behaviour detection.** Pick the dyad, tune the contact and follow tolerances (in real
+centimetres once calibrated), tick the behaviours you care about, hit **Detect**, and read the
+per-behaviour summary table while the gantt fills in below.
+
+<div align="center">
+<img src="docs/screenshot_social.png" alt="Social behaviour panel" width="380">
+</div>
 
 ---
 

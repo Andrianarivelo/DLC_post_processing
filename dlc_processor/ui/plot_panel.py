@@ -59,6 +59,12 @@ _GANTT_COLORS = [
     (116, 199, 236, 200),
 ]
 
+# Minimum on-screen height (px) reserved for each gantt behaviour lane, plus
+# the vertical room the bottom x-axis needs. Used to grow the gantt widget so
+# all lanes stay legible and the wrapping QScrollArea can scroll to them.
+_GANTT_LANE_PX = 22
+_GANTT_AXIS_MARGIN_PX = 40
+
 _METRIC_COLUMNS = [
     "body_speed_px_s",
     "body_speed_cm_s",
@@ -102,7 +108,38 @@ _MENU_QSS = (
 
 
 class PlotPanel(QWidget):
-    """Interactive plot panel with playback-friendly metric rendering."""
+    """Interactive plot panel: metric time-series plot above a behaviour Gantt chart.
+
+    The two sub-plots share a linked x-axis (frame index) so the cursor, zoom
+    and pan stay aligned. The metric plot is tuned for playback: it follows the
+    video cursor, downsamples to preserve visual peaks, and offers several Y
+    scaling modes (robust auto, true-spike, and per-series normalization).
+
+    Public API used by the rest of the app
+    ---------------------------------------
+    Methods:
+        set_animal_dfs(dfs, fps): supply per-animal metric DataFrames + frame rate.
+        set_behavior_arrays(arrays): supply named behaviour arrays. Boolean-like
+            arrays become Gantt lanes; numeric ones become selectable metrics.
+        set_custom_time(times): swap the x-axis label to reflect external timestamps.
+        set_frame_cursor(frame_idx): move the playback cursor (and auto-follow it).
+        show_cleaning_region / hide_cleaning_region / set_cleaning_region:
+            manage the draggable cleaning-range overlay shared by both plots.
+
+    Signals (emitted for the parent controller):
+        cursor_moved(int): user clicked a plot to seek to a frame.
+        cleaning_region_changed(int, int): cleaning region start/end changed.
+        range_start_flag_requested(int) / range_end_flag_requested(int):
+            context-menu requests to flag a range boundary at a frame.
+        range_clear_requested(): context-menu request to clear the flagged range.
+        identity_swap_requested(): context-menu request to swap mouse identities.
+
+    Toolbar controls:
+        Metrics... (selector dialog), Animal selector, and the toggles
+        Follow (auto-scroll to cursor), Auto Y (robust autoscale),
+        Fit spikes (true min/max), Normalize (per-series 0-1), plus
+        Metric/Gantt show-hide, Reset (view) and Export (PNG/SVG).
+    """
 
     cursor_moved = Signal(int)
     cleaning_region_changed = Signal(int, int)
@@ -119,6 +156,8 @@ class PlotPanel(QWidget):
         self._n_frames: int = 0
         self._current_frame: int = 0
         self._follow_playback: bool = True
+        self._fit_spikes: bool = False  # when True, Y uses true full min/max
+        self._normalize: bool = False  # when True, curves min-max normed to [0,1]
         self._show_cleaning_region: bool = False
         self._cleaning_range: tuple[int, int] = (0, 0)
         self._cleaning_region: Optional[pg.LinearRegionItem] = None
@@ -181,20 +220,29 @@ class PlotPanel(QWidget):
 
         tb.addSpacing(8)
 
-        # Follow / Auto Y
-        self._chk_follow = QCheckBox("Follow")
-        self._chk_follow.setChecked(True)
-        self._chk_follow.setStyleSheet("color: #cdd6f4; font-size: 10px;")
-        self._chk_follow.setToolTip("Auto-scroll the plot to follow the video playback cursor")
-        self._chk_follow.toggled.connect(self._on_follow_toggled)
-        tb.addWidget(self._chk_follow)
-
-        self._chk_auto_y = QCheckBox("Auto Y")
-        self._chk_auto_y.setChecked(True)
-        self._chk_auto_y.setStyleSheet("color: #cdd6f4; font-size: 10px;")
-        self._chk_auto_y.setToolTip("Automatically scale the Y axis to fit visible data")
-        self._chk_auto_y.toggled.connect(lambda _: self._update_metric_view(force=True))
-        tb.addWidget(self._chk_auto_y)
+        # Follow / Auto Y / Fit spikes / Normalize toggles
+        self._chk_follow = self._add_toolbar_check(
+            tb, "Follow", True,
+            "Auto-scroll the plot to follow the video playback cursor",
+            self._on_follow_toggled,
+        )
+        self._chk_auto_y = self._add_toolbar_check(
+            tb, "Auto Y", True,
+            "Automatically scale the Y axis to fit visible data",
+            lambda _: self._update_metric_view(force=True),
+        )
+        self._chk_fit_spikes = self._add_toolbar_check(
+            tb, "Fit spikes", False,
+            "Scale Y to the true full min/max so rare spikes are visible.\n"
+            "When off, Auto Y uses a robust percentile range.",
+            self._on_fit_spikes_toggled,
+        )
+        self._chk_normalize = self._add_toolbar_check(
+            tb, "Normalize", False,
+            "Min-max normalize each metric to [0, 1] over its full series so\n"
+            "metrics with different magnitudes become comparable on one axis.",
+            self._on_normalize_toggled,
+        )
 
         tb.addSpacing(4)
 
@@ -263,6 +311,7 @@ class PlotPanel(QWidget):
         self._metric_marker = pg.ScatterPlotItem(size=7, pen=pg.mkPen("#11111b", width=1))
         self._metric_plot.addItem(self._cursor_line_metric)
         self._metric_plot.addItem(self._metric_marker)
+        self._metric_plot.setMinimumHeight(160)
         self._splitter.addWidget(self._metric_plot)
 
         # Gantt chart
@@ -284,9 +333,34 @@ class PlotPanel(QWidget):
         )
         self._gantt_widget.addItem(self._cursor_line_gantt)
         self._gantt_widget.setXLink(self._metric_plot)
-        self._splitter.addWidget(self._gantt_widget)
 
-        self._splitter.setSizes([230, 170])
+        # Wrap the gantt in a vertical-only scroll area so many lanes stay
+        # readable: the gantt grows tall (one lane >= _GANTT_LANE_PX) and the
+        # scroll area scrolls. x-axis stays linked to the metric plot.
+        self._gantt_scroll = QScrollArea()
+        self._gantt_scroll.setWidgetResizable(True)
+        self._gantt_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        self._gantt_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self._gantt_scroll.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+        self._gantt_scroll.setStyleSheet(
+            "QScrollArea { background: #1e1e2e; border: none; }"
+            "QScrollBar:vertical { background: #181825; width: 11px; margin: 0; }"
+            "QScrollBar::handle:vertical { background: #45475a; border-radius: 5px;"
+            " min-height: 24px; }"
+            "QScrollBar::handle:vertical:hover { background: #585b70; }"
+            "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }"
+        )
+        self._gantt_scroll.setWidget(self._gantt_widget)
+        self._splitter.addWidget(self._gantt_scroll)
+
+        # Favour the gantt a little: it usually carries many lanes.
+        self._splitter.setSizes([220, 300])
+        self._splitter.setStretchFactor(0, 1)
+        self._splitter.setStretchFactor(1, 1)
         root.addWidget(self._splitter, 1)
 
         # Pre-populate known metrics (all unchecked by default)
@@ -294,6 +368,18 @@ class PlotPanel(QWidget):
             if col not in self._metric_checks:
                 self._metric_checks[col] = False
         self._update_ui_state()
+
+    def _add_toolbar_check(
+        self, layout: QHBoxLayout, text: str, checked: bool, tooltip: str, slot
+    ) -> QCheckBox:
+        """Create a styled toolbar checkbox, wire ``slot`` and add it to ``layout``."""
+        chk = QCheckBox(text)
+        chk.setChecked(checked)
+        chk.setStyleSheet("color: #cdd6f4; font-size: 10px;")
+        chk.setToolTip(tooltip)
+        chk.toggled.connect(slot)
+        layout.addWidget(chk)
+        return chk
 
     # ── Panel toggles ────────────────────────────────────────────────────────
 
@@ -304,7 +390,7 @@ class PlotPanel(QWidget):
         )
 
     def _toggle_gantt_panel(self, visible: bool) -> None:
-        self._gantt_widget.setVisible(visible)
+        self._gantt_scroll.setVisible(visible)
         self._btn_toggle_gantt.setStyleSheet(
             _BTN_ACTIVE_QSS if visible else _BTN_QSS
         )
@@ -330,16 +416,33 @@ class PlotPanel(QWidget):
     # ── Public API ───────────────────────────────────────────────────────────
 
     def set_custom_time(self, times) -> None:
+        """Attach an optional array of external timestamps for axis labelling.
+
+        The x-axis remains in frame units; only the bottom-axis label text
+        changes to flag that an external time base is loaded. Pass ``None`` to
+        revert to the plain "Frame" label.
+        """
         self._custom_time = times
         label = "Frame (external time loaded)" if times is not None else "Frame"
         self._metric_plot.setLabel("bottom", label)
         self._gantt_widget.setLabel("bottom", label)
 
     def set_animal_dfs(self, dfs: dict, fps: float = 30.0) -> None:
+        """Load per-animal metric DataFrames and refresh both plots.
+
+        ``dfs`` maps animal id -> DataFrame whose columns are metric time series
+        (one row per frame). ``fps`` sets the default follow window width. The
+        animal combo box is rebuilt while preserving the prior selection if it
+        still exists; metric-bearing columns are registered as selectable and a
+        sensible default metric is auto-selected on first load.
+        """
         self._animal_dfs = dfs
         self._fps = fps
+        # Use the longest DataFrame as the canonical frame count (animals may
+        # have ragged lengths after upstream processing).
         self._n_frames = max((len(df) for df in dfs.values()), default=0)
 
+        # Rebuild the animal combo without re-triggering a plot refresh per item.
         prev = self._combo_animal.currentText()
         self._combo_animal.blockSignals(True)
         self._combo_animal.clear()
@@ -352,6 +455,8 @@ class PlotPanel(QWidget):
         self._combo_animal.blockSignals(False)
 
         if dfs:
+            # Discover plottable columns by unit suffix (px/cm/deg/...) so
+            # newly-computed metrics show up in the selector automatically.
             first_df = next(iter(dfs.values()))
             for col in first_df.columns:
                 if col.endswith((
@@ -368,7 +473,14 @@ class PlotPanel(QWidget):
         self._refresh_gantt()
 
     def set_behavior_arrays(self, arrays: dict) -> None:
+        """Load named behaviour arrays and refresh both plots.
+
+        Boolean-like arrays (only 0/1/nan) become Gantt lanes; numeric arrays
+        are registered as additional selectable metrics for the line plot.
+        """
         self._behavior_arrays = arrays
+        # Register non-boolean arrays as plottable metrics; boolean ones are
+        # handled by the Gantt chart instead.
         for name, arr in arrays.items():
             if not _is_boolean_like(arr):
                 if name not in self._metric_checks:
@@ -378,6 +490,7 @@ class PlotPanel(QWidget):
         self._refresh_metric_plot()
 
     def _ensure_default_metric_selected(self, df) -> None:
+        """Select one sensible metric on first load if nothing is checked yet."""
         if any(self._metric_checks.values()):
             return
         for candidate in (
@@ -398,12 +511,20 @@ class PlotPanel(QWidget):
         self._combo_animal.setEnabled(has_animals)
         self._chk_follow.setEnabled(has_animals)
         self._chk_auto_y.setEnabled(has_animals)
+        self._chk_fit_spikes.setEnabled(has_animals)
+        self._chk_normalize.setEnabled(has_animals)
         self._btn_toggle_metric.setEnabled(has_any_plot)
         self._btn_toggle_gantt.setEnabled(bool(self._behavior_arrays))
         if not has_animals:
             self._lbl_active.setText("load data to plot")
 
     def set_frame_cursor(self, frame_idx: int) -> None:
+        """Move the playback cursor to ``frame_idx`` and auto-scroll if following.
+
+        Always repositions the dashed cursor lines and the value marker. When
+        Follow is on, the visible x-window is kept tracking the cursor (see the
+        scrolling heuristics below) without changing the current zoom level.
+        """
         self._current_frame = frame_idx
         self._cursor_line_metric.setValue(frame_idx)
         self._cursor_line_gantt.setValue(frame_idx)
@@ -417,12 +538,13 @@ class PlotPanel(QWidget):
         window = max(0.0, xmax - xmin)
         target_window = float(self._default_window())
 
-        if window < 2:
+        # Snap back to the default window when it has collapsed or grown too wide.
+        if window < 2 or window > target_window * 1.5:
             self._set_default_x_range(center_on=frame_idx)
             return
-        if window > target_window * 1.5:
-            self._set_default_x_range(center_on=frame_idx)
-            return
+        # Otherwise keep the user's current zoom and only nudge the window when
+        # the cursor drifts into the outer 15% margins, re-anchoring it 20% in
+        # from the left edge (clamped so we never scroll past the data ends).
         if frame_idx < xmin + window * 0.15 or frame_idx > xmin + window * 0.85:
             new_xmin = frame_idx - window * 0.2
             max_xmin = max(0.0, self._n_frames - window)
@@ -432,8 +554,17 @@ class PlotPanel(QWidget):
     # ── Refresh plots ────────────────────────────────────────────────────────
 
     def _refresh_metric_plot(self) -> None:
-        prev_range = self._metric_plot.getPlotItem().getViewBox().viewRange()
+        """Rebuild the metric line plot from the current selection and modes.
+
+        Clears and recreates one curve per checked metric, caches each full
+        series (for fast windowed redraws and the value marker), applies
+        Normalize when enabled, preserves the prior x-range when sensible, and
+        finally triggers a Y-range/view update. Cheap to call on any selection,
+        animal, or normalize-mode change.
+        """
         plot_item = self._metric_plot.getPlotItem()
+        prev_range = plot_item.getViewBox().viewRange()
+        # Drop any existing legend so it can be rebuilt for the new curve set.
         legend = getattr(plot_item, "legend", None)
         if legend is not None:
             try:
@@ -448,6 +579,9 @@ class PlotPanel(QWidget):
         self._metric_full_series = {}
         self._metric_curves = {}
         self._metric_view_signature = None
+        self._metric_plot.setLabel(
+            "left", "Normalized (0-1)" if self._normalize else "Value"
+        )
 
         aid = self._combo_animal.currentText()
         if not aid and self._animal_dfs:
@@ -461,8 +595,14 @@ class PlotPanel(QWidget):
             y = self._metric_array_for(col, aid)
             if y is None:
                 continue
+            if self._normalize:
+                # Min-max each series into [0, 1] so disparate magnitudes share
+                # one axis; nans are preserved so connect="finite" still breaks.
+                y = _normalize_full(y)
 
             color = _PLOT_COLORS[color_idx % len(_PLOT_COLORS)]
+            # connect="finite" leaves gaps at nans (missing/invalid frames)
+            # instead of drawing a misleading straight line across them.
             curve = pg.PlotDataItem(
                 pen=pg.mkPen(color, width=1.5),
                 connect="finite",
@@ -483,6 +623,8 @@ class PlotPanel(QWidget):
             color_idx += 1
 
         if self._n_frames > 0:
+            # Preserve the user's prior x-window across a rebuild (clamped to the
+            # data); fall back to the default follow window if it was invalid.
             xmin, xmax = prev_range[0]
             if np.isfinite(xmin) and np.isfinite(xmax) and xmax > xmin:
                 xmax = min(float(self._n_frames), float(xmax))
@@ -496,6 +638,15 @@ class PlotPanel(QWidget):
         self._update_metric_view(force=True)
 
     def _refresh_gantt(self) -> None:
+        """Rebuild the behaviour Gantt chart from the boolean behaviour arrays.
+
+        Each boolean-like behaviour becomes one horizontal lane; its True spans
+        (from ``_bool_bouts``) are drawn as bars. The widget is grown to
+        ``n_rows * _GANTT_LANE_PX`` (plus axis margin) so every lane keeps a
+        legible height and the wrapping QScrollArea scrolls to reach them all.
+        The y-axis is inverted so the first behaviour sits at the top, and the
+        x-axis stays linked to the metric plot.
+        """
         prev_range = self._gantt_widget.getPlotItem().getViewBox().viewRange()
         self._gantt_widget.clear()
         self._gantt_widget.addItem(self._cursor_line_gantt)
@@ -510,21 +661,36 @@ class PlotPanel(QWidget):
             return
 
         names = [name for name, _arr in bool_behaviors]
+        # Lane span on the x-axis: widest behaviour array, never below frame count.
         width = max((len(arr) for _name, arr in bool_behaviors), default=self._n_frames)
         width = max(width, self._n_frames, 1)
         n_rows = len(names)
+
+        # Grow the gantt tall enough that every lane gets a readable height;
+        # the wrapping QScrollArea then scrolls vertically to reach them all.
+        self._gantt_widget.setMinimumHeight(
+            n_rows * _GANTT_LANE_PX + _GANTT_AXIS_MARGIN_PX
+        )
 
         # Draw behaviour bouts as explicit bars so sparse events stay readable.
         no_pen = QPen(Qt.PenStyle.NoPen)
         lane_span = float(width)
         for row_idx, (_name, arr) in enumerate(bool_behaviors):
             r, g, b, _a = _GANTT_COLORS[row_idx % len(_GANTT_COLORS)]
-            bg = QGraphicsRectItem(0.0, row_idx - 0.36, lane_span, 0.72)
-            bg.setBrush(QBrush(QColor(r, g, b, 24)))
+            # Subtle alternating row shading for lane separation: tint odd rows
+            # with the lane colour, even rows with a neutral grey wash.
+            if row_idx % 2 == 0:
+                bg_brush = QBrush(QColor(69, 71, 90, 38))
+            else:
+                bg_brush = QBrush(QColor(r, g, b, 26))
+            bg = QGraphicsRectItem(0.0, row_idx - 0.5, lane_span, 1.0)
+            bg.setBrush(bg_brush)
             bg.setPen(no_pen)
             bg.setZValue(0)
             self._gantt_widget.addItem(bg)
 
+            # Foreground bout bars: one rect per [start, stop) True run, inset
+            # vertically (0.68 of the lane) and raised above background/lines.
             for start, stop in _bool_bouts(arr):
                 if stop <= start:
                     continue
@@ -545,8 +711,8 @@ class PlotPanel(QWidget):
 
         # Y-axis tick labels — plain text (pyqtgraph AxisItem doesn't render HTML)
         axis = self._gantt_widget.getPlotItem().getAxis("left")
-        axis.setStyle(tickLength=0)
-        axis.setWidth(160)
+        axis.setStyle(tickLength=0, tickFont=pg.QtGui.QFont("sans-serif", 10))
+        axis.setWidth(170)
         ticks = [(row_idx, _short_name(name)) for row_idx, name in enumerate(names)]
         axis.setTicks([ticks])
         axis.setTextPen(pg.mkPen("#cdd6f4"))
@@ -564,6 +730,9 @@ class PlotPanel(QWidget):
         self._gantt_widget.setYRange(-0.5, n_rows - 0.5, padding=0.05)
 
         if self._n_frames > 0:
+            # Preserve the prior x-window across rebuilds; otherwise show the
+            # default follow window from frame 0. (X is linked to the metric
+            # plot, so this also keeps both plots aligned.)
             xmin, xmax = prev_range[0]
             if np.isfinite(xmin) and np.isfinite(xmax) and xmax > xmin:
                 self._gantt_widget.setXRange(
@@ -579,7 +748,12 @@ class PlotPanel(QWidget):
         self._update_gantt_label_positions()
 
     def _update_gantt_label_positions(self, *_args) -> None:
-        """Pin floating lane labels to the left edge of the visible viewport."""
+        """Pin floating lane labels to the left edge of the visible viewport.
+
+        Connected to the gantt ViewBox ``sigRangeChanged`` so the colour-swatch
+        labels re-anchor to the current left edge whenever the view pans/zooms,
+        keeping them on-screen instead of scrolling off with the data.
+        """
         if not self._gantt_labels:
             return
         vb = self._gantt_widget.getPlotItem().getViewBox()
@@ -592,6 +766,11 @@ class PlotPanel(QWidget):
     # ── Data helpers ─────────────────────────────────────────────────────────
 
     def _metric_array_for(self, col: str, aid: str) -> Optional[np.ndarray]:
+        """Return the float series for metric ``col`` of animal ``aid``.
+
+        Prefers the animal's DataFrame column; falls back to a (numeric)
+        behaviour array. Returns ``None`` for missing or boolean-like data.
+        """
         if aid and aid in self._animal_dfs and col in self._animal_dfs[aid].columns:
             return self._animal_dfs[aid][col].to_numpy(dtype=np.float64)
         arr = self._behavior_arrays.get(col)
@@ -606,7 +785,20 @@ class PlotPanel(QWidget):
         if checked and self._n_frames > 0:
             self._set_default_x_range(center_on=self._current_frame)
 
+    def _on_fit_spikes_toggled(self, checked: bool) -> None:
+        # Fit spikes only affects Y-range selection, not the curve data, so a
+        # view update (no re-plot) is enough.
+        self._fit_spikes = checked
+        self._update_metric_view(force=True)
+
+    def _on_normalize_toggled(self, checked: bool) -> None:
+        self._normalize = checked
+        # Normalization changes the plotted y-values, so re-plot the curves.
+        self._refresh_metric_plot()
+
     def _on_manual_zoom(self, *_args) -> None:
+        # A manual pan/zoom means the user wants control: drop follow mode so we
+        # stop fighting them by auto-scrolling back to the cursor.
         self._follow_playback = False
         if self._chk_follow.isChecked():
             self._chk_follow.blockSignals(True)
@@ -639,6 +831,7 @@ class PlotPanel(QWidget):
         self._seek_from_scene(self._gantt_widget.getPlotItem().getViewBox(), event.scenePos())
 
     def _seek_from_scene(self, view_box: pg.ViewBox, scene_pos) -> None:
+        """Map a scene click to a frame, move the cursor and emit ``cursor_moved``."""
         mouse_point = view_box.mapSceneToView(scene_pos)
         frame = int(round(mouse_point.x()))
         if 0 <= frame < self._n_frames:
@@ -648,6 +841,11 @@ class PlotPanel(QWidget):
     # ── Cleaning region ──────────────────────────────────────────────────────
 
     def show_cleaning_region(self, start: int = 0, end: int = 0) -> None:
+        """Show the draggable cleaning-range overlay on both plots.
+
+        Uses the given ``[start, end]`` frames, or seeds a default window if no
+        range was set before. Emits ``cleaning_region_changed``.
+        """
         if start > 0 or end > 0:
             self._cleaning_range = (start, end)
         elif self._cleaning_range == (0, 0):
@@ -658,6 +856,7 @@ class PlotPanel(QWidget):
         self.cleaning_region_changed.emit(*self._cleaning_range)
 
     def hide_cleaning_region(self) -> None:
+        """Remove the cleaning-range overlay from both plots."""
         self._show_cleaning_region = False
         if self._cleaning_region is not None:
             self._metric_plot.removeItem(self._cleaning_region)
@@ -667,6 +866,11 @@ class PlotPanel(QWidget):
             self._cleaning_region_gantt = None
 
     def set_cleaning_region(self, start: int, end: int) -> None:
+        """Programmatically update the cleaning range (hides it if both <= 0).
+
+        Region item signals are blocked during the update so this does not
+        re-emit ``cleaning_region_changed`` back to the caller.
+        """
         if start <= 0 and end <= 0:
             self.hide_cleaning_region()
             return
@@ -680,6 +884,19 @@ class PlotPanel(QWidget):
             self._cleaning_region_gantt.setRegion([start, end])
             self._cleaning_region_gantt.blockSignals(False)
 
+    def _make_cleaning_region(self, plot: pg.PlotWidget, on_change) -> pg.LinearRegionItem:
+        """Build a draggable cleaning-region item on ``plot`` for ``_cleaning_range``."""
+        s, e = self._cleaning_range
+        region = pg.LinearRegionItem(
+            values=[s, e],
+            brush=pg.mkBrush(124, 58, 237, 30),
+            pen=pg.mkPen("#7c3aed", width=1),
+        )
+        region.sigRegionChangeFinished.connect(self._on_cleaning_region_moved)
+        region.sigRegionChanged.connect(on_change)
+        plot.addItem(region)
+        return region
+
     def _add_metric_cleaning_region(self) -> None:
         s, e = self._cleaning_range
         if e <= s:
@@ -689,14 +906,9 @@ class PlotPanel(QWidget):
                 self._metric_plot.removeItem(self._cleaning_region)
             except Exception:
                 pass
-        self._cleaning_region = pg.LinearRegionItem(
-            values=[s, e],
-            brush=pg.mkBrush(124, 58, 237, 30),
-            pen=pg.mkPen("#7c3aed", width=1),
+        self._cleaning_region = self._make_cleaning_region(
+            self._metric_plot, self._sync_gantt_region
         )
-        self._cleaning_region.sigRegionChangeFinished.connect(self._on_cleaning_region_moved)
-        self._cleaning_region.sigRegionChanged.connect(self._sync_gantt_region)
-        self._metric_plot.addItem(self._cleaning_region)
 
     def _add_gantt_cleaning_region(self) -> None:
         s, e = self._cleaning_range
@@ -707,14 +919,9 @@ class PlotPanel(QWidget):
                 self._gantt_widget.removeItem(self._cleaning_region_gantt)
             except Exception:
                 pass
-        self._cleaning_region_gantt = pg.LinearRegionItem(
-            values=[s, e],
-            brush=pg.mkBrush(124, 58, 237, 30),
-            pen=pg.mkPen("#7c3aed", width=1),
+        self._cleaning_region_gantt = self._make_cleaning_region(
+            self._gantt_widget, self._sync_metric_region
         )
-        self._cleaning_region_gantt.sigRegionChangeFinished.connect(self._on_cleaning_region_moved)
-        self._cleaning_region_gantt.sigRegionChanged.connect(self._sync_metric_region)
-        self._gantt_widget.addItem(self._cleaning_region_gantt)
 
     def _sync_gantt_region(self) -> None:
         if self._cleaning_region is not None and self._cleaning_region_gantt is not None:
@@ -741,6 +948,11 @@ class PlotPanel(QWidget):
     # ── View helpers ─────────────────────────────────────────────────────────
 
     def _set_default_x_range(self, center_on: Optional[int] = None) -> None:
+        """Set the x-window to the default width, optionally framing a frame.
+
+        When ``center_on`` is given the window is anchored 20% past that frame
+        (so the cursor sits near the left third), clamped to the data bounds.
+        """
         if self._n_frames <= 0:
             return
         window = float(self._default_window())
@@ -753,12 +965,27 @@ class PlotPanel(QWidget):
         self._metric_plot.setXRange(xmin, xmin + window, padding=0)
 
     def _default_window(self) -> int:
+        """Default visible x-window width in frames.
+
+        Roughly 20 seconds of playback (fps * 20), floored at 300 frames and
+        never wider than the full recording. Drives the follow-window size.
+        """
         if self._n_frames <= 0:
             return 500
         window = max(300, int(round(self._fps * 20.0)))
         return int(min(window, self._n_frames))
 
     def _update_metric_view(self, force: bool = False) -> None:
+        """Re-slice visible data into each curve and rescale the Y axis.
+
+        Called on pan/zoom and mode changes. For the current x-window it asks
+        ``_visible_series`` for downsampled xs/ys plus both true and robust
+        Y bounds, updates each curve, then sets the Y range according to mode:
+        fixed [-0.05, 1.05] under Normalize, else ``_apply_auto_y`` (robust or
+        true-spike). A view signature short-circuits redundant work unless
+        ``force`` is set; ``_updating_metric_view`` guards against the
+        ``setData``/``setYRange`` calls re-triggering this via range signals.
+        """
         if not self._metric_curves:
             self._metric_marker.setData([], [])
             return
@@ -768,41 +995,95 @@ class PlotPanel(QWidget):
         if not np.isfinite(xmin) or not np.isfinite(xmax) or xmax <= xmin:
             xmin, xmax = 0.0, float(self._default_window())
 
+        # Signature of everything that affects the rendered view; if unchanged
+        # (and not forced) we only refresh the marker and skip the redraw.
         signature = (
             int(np.floor(xmin)),
             int(np.ceil(xmax)),
             tuple(self._metric_curves.keys()),
             bool(self._chk_auto_y.isChecked()),
+            bool(self._fit_spikes),
+            bool(self._normalize),
         )
         if not force and signature == self._metric_view_signature:
             self._update_metric_marker()
             return
         self._metric_view_signature = signature
 
-        ymin = np.inf
+        # Aggregate Y bounds across all visible curves: true extremes drive the
+        # Fit-spikes range, robust percentiles drive the default Auto Y range.
+        ymin = np.inf   # true min/max across visible curves
         ymax = -np.inf
+        ylo = np.inf    # robust (percentile) low/high across visible curves
+        yhi = -np.inf
         self._updating_metric_view = True
         try:
             for name, curve in self._metric_curves.items():
                 full_series, _color = self._metric_full_series[name]
-                xs, ys, cur_min, cur_max = _visible_series(full_series, xmin, xmax)
+                xs, ys, cur_min, cur_max, cur_lo, cur_hi = _visible_series(
+                    full_series, xmin, xmax
+                )
                 curve.setData(xs, ys, connect="finite")
                 if cur_min is not None and cur_max is not None:
                     ymin = min(ymin, cur_min)
                     ymax = max(ymax, cur_max)
+                if cur_lo is not None and cur_hi is not None:
+                    ylo = min(ylo, cur_lo)
+                    yhi = max(yhi, cur_hi)
 
-            if self._chk_auto_y.isChecked() and np.isfinite(ymin) and np.isfinite(ymax):
-                if np.isclose(ymin, ymax):
-                    pad = max(1.0, abs(ymin) * 0.05)
-                else:
-                    pad = max((ymax - ymin) * 0.08, 1e-3)
-                self._metric_plot.setYRange(ymin - pad, ymax + pad, padding=0)
+            if self._normalize:
+                # Curves are pre-normalized to [0, 1]; fix the axis with a hair
+                # of headroom so the marker dots at 0 and 1 stay on-screen.
+                self._metric_plot.setYRange(-0.05, 1.05, padding=0)
+            elif self._chk_auto_y.isChecked():
+                self._apply_auto_y(ymin, ymax, ylo, yhi)
         finally:
             self._updating_metric_view = False
 
         self._update_metric_marker()
 
+    def _apply_auto_y(
+        self, ymin: float, ymax: float, ylo: float, yhi: float
+    ) -> None:
+        """Set the metric Y range from aggregated true and robust bounds.
+
+        Rare kinematic spikes (speed/accel/jerk can momentarily jump orders of
+        magnitude) would otherwise force the axis huge and flatten the whole
+        trace to a baseline line. So by default (``Fit spikes`` off) we fit to
+        the robust ``ylo``/``yhi`` percentile bounds, keeping the bulk of the
+        signal filling the view and letting the rare spikes clip off-screen.
+        With ``Fit spikes`` on we fit the true finite min/max so those spikes
+        are fully visible. Either way, 0 is pinned into view when the data is
+        non-negative and rides near the floor, so baselines read naturally
+        instead of floating above the axis.
+        """
+        # ``true_min`` is always the real minimum; ``lo``/``hi`` are the bounds we
+        # actually fit to (true extremes for Fit spikes, robust percentiles else).
+        true_min = ymin
+        lo, hi = (ymin, ymax) if self._fit_spikes else (ylo, yhi)
+        if not (np.isfinite(lo) and np.isfinite(hi)):
+            return
+
+        if np.isclose(lo, hi):
+            pad = max(1.0, abs(lo) * 0.05)
+        else:
+            pad = max((hi - lo) * 0.07, 1e-3)
+        lo_padded = lo - pad
+        hi_padded = hi + pad
+
+        # Keep 0 visible when the data is non-negative and sits near the floor,
+        # so baselines read naturally instead of floating above the axis.
+        if np.isfinite(true_min) and true_min >= 0.0 and lo <= pad * 1.5:
+            lo_padded = min(0.0, lo_padded)
+
+        self._metric_plot.setYRange(lo_padded, hi_padded, padding=0)
+
     def _update_metric_marker(self) -> None:
+        """Place a coloured dot on each curve at the current cursor frame.
+
+        Skips curves whose value at the frame is nan/out of range so missing
+        samples show no marker.
+        """
         if self._n_frames <= 0 or not self._metric_full_series:
             self._metric_marker.setData([], [])
             return
@@ -856,6 +1137,11 @@ class PlotPanel(QWidget):
         act_clear = menu.addAction("Clear flagged range")
         act_clear.triggered.connect(lambda _checked=False: self.range_clear_requested.emit())
 
+    def _add_reset_action(self, menu: QMenu) -> None:
+        act_reset = QAction("Reset view", self)
+        act_reset.triggered.connect(self._reset_zoom)
+        menu.addAction(act_reset)
+
     def _show_plot_context_menu(self, pos) -> None:
         frame = self._frame_from_plot_pos(self._metric_plot, pos)
         menu = QMenu(self)
@@ -871,6 +1157,20 @@ class PlotPanel(QWidget):
 
         menu.addSeparator()
 
+        act_fit_spikes = QAction("Fit spikes (true min/max)", self)
+        act_fit_spikes.setCheckable(True)
+        act_fit_spikes.setChecked(self._fit_spikes)
+        act_fit_spikes.toggled.connect(self._chk_fit_spikes.setChecked)
+        menu.addAction(act_fit_spikes)
+
+        act_normalize = QAction("Normalize curves (0-1)", self)
+        act_normalize.setCheckable(True)
+        act_normalize.setChecked(self._normalize)
+        act_normalize.toggled.connect(self._chk_normalize.setChecked)
+        menu.addAction(act_normalize)
+
+        menu.addSeparator()
+
         act_export_png = QAction("Export as PNG\u2026", self)
         act_export_png.triggered.connect(lambda: self._export_plot("png"))
         menu.addAction(act_export_png)
@@ -881,9 +1181,7 @@ class PlotPanel(QWidget):
 
         menu.addSeparator()
 
-        act_reset = QAction("Reset view", self)
-        act_reset.triggered.connect(self._reset_zoom)
-        menu.addAction(act_reset)
+        self._add_reset_action(menu)
 
         menu.exec(self._metric_plot.mapToGlobal(pos))
 
@@ -896,9 +1194,7 @@ class PlotPanel(QWidget):
 
         menu.addSeparator()
 
-        act_reset = QAction("Reset view", self)
-        act_reset.triggered.connect(self._reset_zoom)
-        menu.addAction(act_reset)
+        self._add_reset_action(menu)
 
         menu.exec(self._gantt_widget.mapToGlobal(pos))
 
@@ -1067,15 +1363,43 @@ class _MetricSelectorDialog(QDialog):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _bool_bouts(arr: np.ndarray) -> list[tuple[int, int]]:
-    """Return [start, stop) runs for True values."""
+    """Extract [start, stop) index runs of consecutive True values.
+
+    Run-length style: pad with False on both ends so the first/last True still
+    produce a rising/falling edge, diff to find +1 (rise) and -1 (fall) edges,
+    and pair them. Used to turn a boolean behaviour mask into Gantt bout bars.
+    """
     values = np.asarray(arr, dtype=bool).reshape(-1)
     if values.size == 0:
         return []
+    # False sentinels guarantee edges exist even when the array starts/ends True.
     padded = np.concatenate([[False], values, [False]])
     edges = np.diff(padded.astype(np.int8))
-    starts = np.flatnonzero(edges == 1)
-    stops = np.flatnonzero(edges == -1)
+    starts = np.flatnonzero(edges == 1)   # False -> True transitions
+    stops = np.flatnonzero(edges == -1)   # True -> False transitions
     return [(int(s), int(e)) for s, e in zip(starts, stops) if e > s]
+
+
+def _normalize_full(y: np.ndarray) -> np.ndarray:
+    """Min-max normalize a full series to [0, 1] over its finite values.
+
+    nan-safe: nan entries stay nan (so ``connect="finite"`` still breaks the
+    line); a constant or all-nan series is left flat at 0.
+    """
+    y = np.asarray(y, dtype=np.float64)
+    finite = np.isfinite(y)
+    if not finite.any():
+        return np.zeros_like(y)
+    lo = float(np.min(y[finite]))
+    hi = float(np.max(y[finite]))
+    span = hi - lo
+    if span <= 0:
+        out = np.zeros_like(y)
+        out[~finite] = np.nan
+        return out
+    out = (y - lo) / span
+    out[~finite] = np.nan
+    return out
 
 
 def _visible_series(
@@ -1083,11 +1407,27 @@ def _visible_series(
     xmin: float,
     xmax: float,
     max_points: int = 2200,
-) -> tuple[np.ndarray, np.ndarray, Optional[float], Optional[float]]:
+    plo: float = 2.0,
+    phi: float = 98.0,
+) -> tuple[
+    np.ndarray, np.ndarray,
+    Optional[float], Optional[float],
+    Optional[float], Optional[float],
+]:
+    """Slice + downsample the visible window.
+
+    Returns (xs, ys, ymin, ymax, ylo, yhi) where ymin/ymax are the true finite
+    min/max over the visible window and ylo/yhi are robust percentile bounds
+    (``plo``/``phi``) used for spike-resistant autoscaling. All nan-safe; the
+    percentiles are computed from the already-sliced finite values so nothing is
+    recomputed redundantly.
+    """
+    empty = np.array([], dtype=np.float64)
+    # Pad the slice by a sample on each side so lines reach the viewport edges.
     start = max(0, int(np.floor(xmin)) - 1)
     stop = min(len(full_series), int(np.ceil(xmax)) + 2)
     if stop <= start:
-        return np.array([], dtype=np.float64), np.array([], dtype=np.float64), None, None
+        return empty, empty, None, None, None, None
 
     xs = np.arange(start, stop, dtype=np.float64)
     ys = np.asarray(full_series[start:stop], dtype=np.float64)
@@ -1095,14 +1435,17 @@ def _visible_series(
     if finite.size:
         ymin = float(np.min(finite))
         ymax = float(np.max(finite))
+        ylo = float(np.percentile(finite, plo))
+        yhi = float(np.percentile(finite, phi))
     else:
-        ymin = None
-        ymax = None
+        ymin = ymax = ylo = yhi = None
 
     if len(xs) <= max_points:
-        return xs, ys, ymin, ymax
+        return xs, ys, ymin, ymax, ylo, yhi
 
-    return (*_downsample_minmax(xs, ys, max_points=max_points), ymin, ymax)
+    # More samples than pixels worth drawing: downsample but keep per-bucket
+    # peaks. Bounds are returned from the full slice, not the downsampled data.
+    return (*_downsample_minmax(xs, ys, max_points=max_points), ymin, ymax, ylo, yhi)
 
 
 def _downsample_minmax(
@@ -1110,6 +1453,15 @@ def _downsample_minmax(
     ys: np.ndarray,
     max_points: int = 2200,
 ) -> tuple[np.ndarray, np.ndarray]:
+    """Min/max-decimate a series to roughly ``max_points`` while keeping peaks.
+
+    Splits the data into ~``max_points/2`` buckets and emits, in x-order, the
+    min and the max sample of each bucket (two points per bucket). This is the
+    standard waveform decimation trick: it preserves the visual envelope so
+    short spikes survive even when there are far more samples than pixels, which
+    naive stride subsampling would drop. nan-only buckets emit a single nan
+    (so ``connect="finite"`` breaks the line there).
+    """
     if len(xs) <= max_points or max_points < 8:
         return xs, ys
 
@@ -1124,10 +1476,13 @@ def _downsample_minmax(
         chunk_y = ys[start:stop]
         finite_mask = np.isfinite(chunk_y)
         if not finite_mask.any():
+            # Gap bucket: one nan keeps the line broken across missing data.
             out_x.append(float(chunk_x[0]))
             out_y.append(np.nan)
             continue
 
+        # Locate the bucket's min and max samples, then emit them in their
+        # original left-to-right order so the drawn envelope stays monotone in x.
         finite_idx = np.flatnonzero(finite_mask)
         valid_y = chunk_y[finite_mask]
         rel_min = finite_idx[int(np.argmin(valid_y))]
@@ -1136,6 +1491,8 @@ def _downsample_minmax(
         for rel_idx in order:
             x_val = float(chunk_x[rel_idx])
             y_val = float(chunk_y[rel_idx])
+            # Skip emitting a point identical to the previous one (e.g. a
+            # single-sample bucket where min == max), avoiding duplicates.
             if out_x and np.isclose(out_x[-1], x_val) and (
                 (np.isnan(out_y[-1]) and np.isnan(y_val)) or np.isclose(out_y[-1], y_val)
             ):
@@ -1242,6 +1599,11 @@ def _short_name(col: str) -> str:
 
 
 def _is_boolean_like(arr: np.ndarray) -> bool:
+    """True if ``arr`` is a boolean mask or a numeric array of only 0/1 (nan ok).
+
+    Decides whether an array becomes a Gantt lane (boolean-like) or a numeric
+    metric curve. An all-nan or non-numeric array is treated as not boolean.
+    """
     arr = np.asarray(arr)
     if np.issubdtype(arr.dtype, np.bool_):
         return True

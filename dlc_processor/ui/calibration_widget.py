@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QHBoxLayout,
     QLabel,
+    QMessageBox,
     QPushButton,
     QSlider,
     QVBoxLayout,
@@ -240,8 +241,15 @@ class CalibrationDialog(QDialog):
             )
 
     def _apply(self) -> None:
-        if self._px_per_cm > 0:
-            self.calibration_done.emit(self._px_per_cm)
+        self._compute()
+        if self._px_per_cm <= 0:
+            QMessageBox.warning(
+                self,
+                "Calibration incomplete",
+                "Draw a line and set its known length before applying calibration.",
+            )
+            return
+        self.calibration_done.emit(float(self._px_per_cm))
         self.accept()
 
     def px_per_cm(self) -> float:

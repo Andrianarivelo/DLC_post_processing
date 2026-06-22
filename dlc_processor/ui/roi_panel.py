@@ -10,13 +10,24 @@ from __future__ import annotations
 import logging
 from typing import Optional
 
+import cv2
 import numpy as np
 import pandas as pd
-from PySide6.QtCore import Signal, Slot
+from PySide6.QtCore import QPointF, QRectF, Qt, Signal, Slot
+from PySide6.QtGui import QBrush, QColor, QImage, QPainter, QPen, QPixmap, QPolygonF
 from PySide6.QtWidgets import (
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QDoubleSpinBox,
     QFormLayout,
+    QGraphicsItem,
+    QGraphicsEllipseItem,
+    QGraphicsPixmapItem,
+    QGraphicsPolygonItem,
+    QGraphicsRectItem,
+    QGraphicsScene,
+    QGraphicsView,
     QGroupBox,
     QHBoxLayout,
     QLabel,
@@ -110,6 +121,11 @@ class ROIPanel(QGroupBox):
         self._fps = 25.0
         self._frame_w = 0
         self._frame_h = 0
+        self._px_per_cm = 0.0
+        self._distance_unit_mode = "px"
+        self._video_path = ""
+        self._current_frame = 0
+        self._frame_numbers: Optional[np.ndarray] = None
         self._setup_ui()
 
     # ── UI ────────────────────────────────────────────────────────────────
@@ -127,6 +143,7 @@ class ROIPanel(QGroupBox):
         row1.addWidget(QLabel("Shape:"))
         self._combo_shape = QComboBox()
         self._combo_shape.addItems(["circle", "rectangle", "polygon"])
+        self._combo_shape.setToolTip("Circle: centre + radius | Rectangle: centre + width/height | Polygon: list of vertices")
         self._combo_shape.currentTextChanged.connect(self._on_shape_changed)
         row1.addWidget(self._combo_shape)
         row1.addWidget(QLabel("Name:"))
@@ -143,12 +160,14 @@ class ROIPanel(QGroupBox):
         self._spin_cx.setRange(0, 10000)
         self._spin_cx.setDecimals(0)
         self._spin_cx.setSuffix(" px")
+        self._spin_cx.setToolTip("Horizontal centre of the ROI in pixels from the left edge")
         form.addRow("Centre X:", self._spin_cx)
 
         self._spin_cy = QDoubleSpinBox()
         self._spin_cy.setRange(0, 10000)
         self._spin_cy.setDecimals(0)
         self._spin_cy.setSuffix(" px")
+        self._spin_cy.setToolTip("Vertical centre of the ROI in pixels from the top edge")
         form.addRow("Centre Y:", self._spin_cy)
 
         self._spin_radius = QDoubleSpinBox()
@@ -156,6 +175,7 @@ class ROIPanel(QGroupBox):
         self._spin_radius.setValue(50)
         self._spin_radius.setDecimals(0)
         self._spin_radius.setSuffix(" px")
+        self._spin_radius.setToolTip("Circle radius in pixels")
         self._lbl_radius = QLabel("Radius:")
         form.addRow(self._lbl_radius, self._spin_radius)
 
@@ -164,6 +184,7 @@ class ROIPanel(QGroupBox):
         self._spin_width.setValue(100)
         self._spin_width.setDecimals(0)
         self._spin_width.setSuffix(" px")
+        self._spin_width.setToolTip("Rectangle width in pixels")
         self._lbl_width = QLabel("Width:")
         form.addRow(self._lbl_width, self._spin_width)
 
@@ -172,20 +193,28 @@ class ROIPanel(QGroupBox):
         self._spin_height.setValue(100)
         self._spin_height.setDecimals(0)
         self._spin_height.setSuffix(" px")
+        self._spin_height.setToolTip("Rectangle height in pixels")
         self._lbl_height = QLabel("Height:")
         form.addRow(self._lbl_height, self._spin_height)
 
         self._edit_points = QLineEdit()
         self._edit_points.setPlaceholderText("x1,y1;x2,y2;x3,y3;...")
+        self._edit_points.setToolTip("Polygon vertices as semicolon-separated x,y pairs (minimum 3 points)")
         self._edit_points.setToolTip("Semicolon-separated x,y pairs for polygon vertices")
         self._lbl_points = QLabel("Points:")
         form.addRow(self._lbl_points, self._edit_points)
 
         add_lay.addLayout(form)
 
-        btn_add = QPushButton("Add ROI")
-        btn_add.clicked.connect(self._add_roi)
-        add_lay.addWidget(btn_add)
+        self._btn_add_roi = QPushButton("Add ROI")
+        self._btn_add_roi.setToolTip("Add a region of interest from the coordinates above")
+        self._btn_add_roi.clicked.connect(self._add_roi)
+        add_lay.addWidget(self._btn_add_roi)
+
+        self._btn_draw_roi = QPushButton("Draw / Edit on Frame…")
+        self._btn_draw_roi.setToolTip("Open a visual editor to draw ROIs directly on the video frame")
+        self._btn_draw_roi.clicked.connect(self._open_roi_editor)
+        add_lay.addWidget(self._btn_draw_roi)
         layout.addWidget(add_group)
 
         # Show/hide based on shape
@@ -208,9 +237,10 @@ class ROIPanel(QGroupBox):
         list_lay.addWidget(scroll)
 
         btn_row = QHBoxLayout()
-        btn_clear = QPushButton("Clear All")
-        btn_clear.clicked.connect(self._clear_all)
-        btn_row.addWidget(btn_clear)
+        self._btn_clear = QPushButton("Clear All")
+        self._btn_clear.setToolTip("Remove all defined ROIs")
+        self._btn_clear.clicked.connect(self._clear_all)
+        btn_row.addWidget(self._btn_clear)
         btn_row.addStretch()
         list_lay.addLayout(btn_row)
         layout.addWidget(list_group)
@@ -223,6 +253,7 @@ class ROIPanel(QGroupBox):
         kp_row.addWidget(QLabel("Keypoint:"))
         self._combo_keypoint = QComboBox()
         self._combo_keypoint.addItem("body_centre")
+        self._combo_keypoint.setToolTip("Which bodypart to track for ROI occupancy")
         kp_row.addWidget(self._combo_keypoint)
 
         self._spin_proximity = QDoubleSpinBox()
@@ -234,9 +265,15 @@ class ROIPanel(QGroupBox):
         kp_row.addWidget(self._spin_proximity)
         analysis_lay.addLayout(kp_row)
 
-        btn_analyze = QPushButton("Analyze ROI Occupancy")
-        btn_analyze.clicked.connect(self._analyze)
-        analysis_lay.addWidget(btn_analyze)
+        self._btn_analyze = QPushButton("Analyze ROI Occupancy")
+        self._btn_analyze.setToolTip("Compute time spent in each ROI per animal")
+        self._btn_analyze.clicked.connect(self._analyze)
+        analysis_lay.addWidget(self._btn_analyze)
+
+        self._lbl_status = QLabel("")
+        self._lbl_status.setWordWrap(True)
+        self._lbl_status.setStyleSheet("color: #a6adc8; font-size: 11px;")
+        analysis_lay.addWidget(self._lbl_status)
 
         self._results_table = QTableWidget(0, 6)
         self._results_table.setHorizontalHeaderLabels([
@@ -247,6 +284,7 @@ class ROIPanel(QGroupBox):
         analysis_lay.addWidget(self._results_table)
 
         layout.addWidget(analysis_group)
+        self._update_ui_state()
 
     # ── Shape visibility ─────────────────────────────────────────────────
 
@@ -282,6 +320,7 @@ class ROIPanel(QGroupBox):
             for bp in get_bodyparts(first_df):
                 if bp not in ("body_centre",):
                     self._combo_keypoint.addItem(bp)
+        self._update_ui_state()
 
     def set_video_info(self, w: int, h: int) -> None:
         self._frame_w = w
@@ -292,9 +331,69 @@ class ROIPanel(QGroupBox):
         if self._spin_cx.value() == 0:
             self._spin_cx.setValue(w // 2)
             self._spin_cy.setValue(h // 2)
+        self._update_ui_state()
+
+    def set_video_path(self, path: str) -> None:
+        self._video_path = path
+        self._update_ui_state()
+
+    def set_current_frame(self, frame_idx: int) -> None:
+        self._current_frame = int(frame_idx)
+        self._update_ui_state()
+
+    def set_frame_numbers(self, frame_numbers) -> None:
+        if frame_numbers is None:
+            self._frame_numbers = None
+            return
+        arr = np.asarray(frame_numbers, dtype=np.int64).reshape(-1)
+        self._frame_numbers = arr if len(arr) > 0 else None
+
+    def set_calibration(self, px_per_cm: float) -> None:
+        new_scale = float(max(px_per_cm, 0.0))
+        old_scale = self._px_per_cm
+        if np.isclose(new_scale, old_scale):
+            self._px_per_cm = new_scale
+            return
+        if new_scale > 0 and self._distance_unit_mode == "px":
+            self._spin_proximity.setValue(self._spin_proximity.value() / new_scale)
+            self._spin_proximity.setSuffix(" cm")
+            self._distance_unit_mode = "cm"
+        elif new_scale <= 0 and old_scale > 0 and self._distance_unit_mode == "cm":
+            self._spin_proximity.setValue(self._spin_proximity.value() * old_scale)
+            self._spin_proximity.setSuffix(" px")
+            self._distance_unit_mode = "px"
+        self._px_per_cm = new_scale
+        self._update_ui_state()
 
     def get_rois(self) -> list[ROIDef]:
         return list(self._rois)
+
+    def _update_ui_state(self) -> None:
+        has_video = bool(self._video_path)
+        has_data = bool(self._animal_dfs)
+        has_rois = bool(self._rois)
+        self._btn_draw_roi.setEnabled(has_video)
+        self._btn_clear.setEnabled(has_rois)
+        self._btn_analyze.setEnabled(has_rois and has_data)
+        self._combo_keypoint.setEnabled(has_data)
+
+        if not has_video:
+            self._lbl_status.setText("Load a video to draw ROIs directly on a frame.")
+            return
+        if not has_rois:
+            self._lbl_status.setText(
+                f"Video ready at frame {self._current_frame}. Add ROIs manually or use Draw / Edit on Frame."
+            )
+            return
+        if not has_data:
+            self._lbl_status.setText(
+                f"{len(self._rois)} ROI(s) defined. Load tracking data to run occupancy analysis."
+            )
+            return
+        unit_hint = "Proximity is in cm." if self._distance_unit_mode == "cm" else "Proximity is in px."
+        self._lbl_status.setText(
+            f"Ready: {len(self._rois)} ROI(s), {len(self._animal_dfs)} animal(s), frame {self._current_frame}. {unit_hint}"
+        )
 
     # ── Add / Remove ROIs ────────────────────────────────────────────────
 
@@ -308,6 +407,7 @@ class ROIPanel(QGroupBox):
         if shape == "polygon":
             pts = self._parse_points(self._edit_points.text())
             if len(pts) < 3:
+                self._lbl_status.setText("Polygon ROIs need at least 3 points.")
                 return
             roi = ROIDef(name=name, shape="polygon", points=pts, color=color)
         elif shape == "circle":
@@ -328,17 +428,45 @@ class ROIPanel(QGroupBox):
         self._rebuild_roi_list()
         self.rois_changed.emit(self._rois)
         self._edit_name.clear()
+        self._update_ui_state()
+
+    def _open_roi_editor(self) -> None:
+        """Open the interactive ROI editor on the current video frame."""
+        if not self._video_path:
+            self._lbl_status.setText("Load a video before opening the ROI editor.")
+            return
+        dlg = _ROIDrawDialog(
+            rois=self._rois,
+            shape=self._combo_shape.currentText(),
+            video_path=self._video_path,
+            frame_idx=self._source_frame_for_current_row(),
+            frame_w=max(self._frame_w, 640),
+            frame_h=max(self._frame_h, 360),
+            parent=self,
+        )
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self._rois = dlg.rois()
+            self._rebuild_roi_list()
+            self.rois_changed.emit(self._rois)
+            self._update_ui_state()
+
+    def _source_frame_for_current_row(self) -> int:
+        if self._frame_numbers is not None and 0 <= self._current_frame < len(self._frame_numbers):
+            return int(self._frame_numbers[self._current_frame])
+        return int(self._current_frame)
 
     def _remove_roi(self, name: str) -> None:
         self._rois = [r for r in self._rois if r.name != name]
         self._rebuild_roi_list()
         self.rois_changed.emit(self._rois)
+        self._update_ui_state()
 
     def _clear_all(self) -> None:
         self._rois.clear()
         self._rebuild_roi_list()
         self.rois_changed.emit(self._rois)
         self._results_table.setRowCount(0)
+        self._update_ui_state()
 
     def _rebuild_roi_list(self) -> None:
         # Clear existing widgets (except final stretch)
@@ -401,6 +529,7 @@ class ROIPanel(QGroupBox):
     @Slot()
     def _analyze(self) -> None:
         if not self._rois or not self._animal_dfs:
+            self._update_ui_state()
             return
 
         from dlc_processor.core.roi_analyzer import ROIAnalyzer, ROI
@@ -412,7 +541,11 @@ class ROIPanel(QGroupBox):
                 analyzer.add_roi(roi_def.name, poly)
 
         keypoint = self._combo_keypoint.currentText()
-        proximity_px = self._spin_proximity.value()
+        proximity_px = (
+            self._spin_proximity.value() * self._px_per_cm
+            if self._distance_unit_mode == "cm" and self._px_per_cm > 0
+            else self._spin_proximity.value()
+        )
 
         rows: list[tuple[str, ...]] = []
         for animal_id, df in self._animal_dfs.items():
@@ -440,6 +573,9 @@ class ROIPanel(QGroupBox):
         for r, row in enumerate(rows):
             for c, val in enumerate(row):
                 self._results_table.setItem(r, c, QTableWidgetItem(val))
+        self._lbl_status.setText(
+            f"Analyzed {len(self._rois)} ROI(s) across {len(self._animal_dfs)} animal(s)."
+        )
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -498,3 +634,400 @@ def _resolve_kp(name: str, bps: list[str]) -> Optional[str]:
         if bp.lower() == nl:
             return bp
     return bps[0] if bps else None
+
+
+class _ROIDrawDialog(QDialog):
+    """Interactive ROI editor on top of the current video frame."""
+
+    def __init__(
+        self,
+        rois: list[ROIDef],
+        shape: str,
+        video_path: str,
+        frame_idx: int,
+        frame_w: int,
+        frame_h: int,
+        parent: Optional[QWidget] = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Draw ROIs")
+        self.setMinimumSize(900, 620)
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(6)
+
+        controls = QHBoxLayout()
+        controls.addWidget(QLabel("Shape:"))
+        self._combo_shape = QComboBox()
+        self._combo_shape.addItems(["rectangle", "circle", "polygon"])
+        self._combo_shape.setCurrentText(shape if shape in {"rectangle", "circle", "polygon"} else "rectangle")
+        controls.addWidget(self._combo_shape)
+
+        btn_duplicate = QPushButton("Duplicate Selected")
+        btn_larger = QPushButton("Larger")
+        btn_smaller = QPushButton("Smaller")
+        btn_delete = QPushButton("Delete Selected")
+        controls.addWidget(btn_duplicate)
+        controls.addWidget(btn_larger)
+        controls.addWidget(btn_smaller)
+        controls.addWidget(btn_delete)
+        controls.addStretch()
+        layout.addLayout(controls)
+
+        hint = QLabel(
+            "Left click-drag to draw rectangles/circles. For polygons, left click to add points and "
+            "double-click to finish. Existing ROIs can be dragged; use Larger/Smaller to resize."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #a6adc8; font-size: 11px;")
+        layout.addWidget(hint)
+
+        self._view = _ROIDrawView(video_path, frame_idx, frame_w, frame_h, rois, parent=self)
+        self._view.set_draw_shape(self._combo_shape.currentText())
+        self._combo_shape.currentTextChanged.connect(self._view.set_draw_shape)
+        btn_duplicate.clicked.connect(self._view.duplicate_selected)
+        btn_larger.clicked.connect(lambda: self._view.resize_selected(1.12))
+        btn_smaller.clicked.connect(lambda: self._view.resize_selected(1.0 / 1.12))
+        btn_delete.clicked.connect(self._view.delete_selected)
+        layout.addWidget(self._view, 1)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def rois(self) -> list[ROIDef]:
+        return self._view.rois()
+
+
+class _ROIDrawView(QGraphicsView):
+    """Graphics view that supports left-click ROI drawing and editing."""
+
+    def __init__(
+        self,
+        video_path: str,
+        frame_idx: int,
+        frame_w: int,
+        frame_h: int,
+        rois: list[ROIDef],
+        parent: Optional[QWidget] = None,
+    ) -> None:
+        super().__init__(parent)
+        self._scene = QGraphicsScene(self)
+        self.setScene(self._scene)
+        self.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        self.setDragMode(QGraphicsView.DragMode.RubberBandDrag)
+        self.setBackgroundBrush(QColor("#11111b"))
+
+        self._background_item: Optional[QGraphicsPixmapItem] = None
+        self._roi_items: list[QGraphicsItem] = []
+        self._current_shape = "rectangle"
+        self._drawing = False
+        self._start_pos = QPointF()
+        self._draft_item: Optional[QGraphicsItem] = None
+        self._draft_points: list[QPointF] = []
+
+        bg = self._load_background(video_path, frame_idx, frame_w, frame_h)
+        self._background_item = self._scene.addPixmap(bg)
+        self._background_item.setZValue(-100)
+        self._scene.setSceneRect(QRectF(bg.rect()))
+
+        for roi in rois:
+            self._add_roi_item(roi)
+
+        self.fitInView(self._scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
+
+    def set_draw_shape(self, shape: str) -> None:
+        self._current_shape = shape
+        self._clear_draft()
+
+    def rois(self) -> list[ROIDef]:
+        return [self._item_to_roi(item) for item in self._roi_items if item.scene() is self._scene]
+
+    def duplicate_selected(self) -> None:
+        selected = self._selected_roi_items()
+        for item in selected:
+            roi = self._item_to_roi(item)
+            roi.name = self._unique_name(f"{roi.name}_copy")
+            if roi.shape == "polygon":
+                roi.points = [(x + 20.0, y + 20.0) for x, y in roi.points]
+            else:
+                roi.cx += 20.0
+                roi.cy += 20.0
+            self._add_roi_item(roi).setSelected(True)
+
+    def resize_selected(self, factor: float) -> None:
+        for item in self._selected_roi_items():
+            shape = item.data(0)
+            if shape == "rectangle" and isinstance(item, QGraphicsRectItem):
+                rect = item.rect()
+                item.setRect(-rect.width() * factor / 2.0, -rect.height() * factor / 2.0,
+                             rect.width() * factor, rect.height() * factor)
+            elif shape == "circle" and isinstance(item, QGraphicsEllipseItem):
+                rect = item.rect()
+                item.setRect(-rect.width() * factor / 2.0, -rect.height() * factor / 2.0,
+                             rect.width() * factor, rect.height() * factor)
+            elif shape == "polygon" and isinstance(item, QGraphicsPolygonItem):
+                item.setPolygon(QPolygonF([QPointF(pt.x() * factor, pt.y() * factor) for pt in item.polygon()]))
+
+    def delete_selected(self) -> None:
+        for item in self._selected_roi_items():
+            if item in self._roi_items:
+                self._roi_items.remove(item)
+            self._scene.removeItem(item)
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            clicked = self.itemAt(event.position().toPoint())
+            if clicked and clicked is not self._background_item and clicked in self._roi_items:
+                super().mousePressEvent(event)
+                return
+
+            scene_pos = self.mapToScene(event.position().toPoint())
+            if self._current_shape == "polygon":
+                self._draft_points.append(scene_pos)
+                self._update_polygon_preview(scene_pos)
+                event.accept()
+                return
+
+            self._drawing = True
+            self._start_pos = scene_pos
+            self._create_draft_item(scene_pos, scene_pos)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:
+        scene_pos = self.mapToScene(event.position().toPoint())
+        if self._drawing and self._draft_item is not None:
+            self._update_draft_item(self._start_pos, scene_pos)
+            event.accept()
+            return
+        if self._current_shape == "polygon" and self._draft_points:
+            self._update_polygon_preview(scene_pos)
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        if self._drawing and event.button() == Qt.MouseButton.LeftButton and self._draft_item is not None:
+            self._drawing = False
+            end_pos = self.mapToScene(event.position().toPoint())
+            self._finalize_drawn_shape(self._start_pos, end_pos)
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event) -> None:
+        if self._current_shape == "polygon" and len(self._draft_points) >= 3:
+            self._finalize_polygon()
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self.fitInView(self._scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
+
+    def _selected_roi_items(self) -> list[QGraphicsItem]:
+        return [item for item in self._scene.selectedItems() if item in self._roi_items]
+
+    def _load_background(self, video_path: str, frame_idx: int, frame_w: int, frame_h: int) -> QPixmap:
+        if video_path:
+            cap = cv2.VideoCapture(video_path)
+            try:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+                ok, frame = cap.read()
+            finally:
+                cap.release()
+            if ok:
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                h, w, ch = rgb.shape
+                qimg = QImage(rgb.data, w, h, w * ch, QImage.Format.Format_RGB888).copy()
+                return QPixmap.fromImage(qimg)
+
+        img = QImage(max(frame_w, 1), max(frame_h, 1), QImage.Format.Format_ARGB32_Premultiplied)
+        img.fill(QColor("#1e1e2e"))
+        return QPixmap.fromImage(img)
+
+    def _make_pen(self, color: str, dashed: bool = False) -> QPen:
+        pen = QPen(QColor(color), 2)
+        if dashed:
+            pen.setStyle(Qt.PenStyle.DashLine)
+        return pen
+
+    def _make_brush(self, color: str, alpha: int = 48) -> QBrush:
+        c = QColor(color)
+        c.setAlpha(alpha)
+        return QBrush(c)
+
+    def _unique_name(self, prefix: str) -> str:
+        existing = {self._item_to_roi(item).name for item in self._roi_items if item.scene() is self._scene}
+        if prefix not in existing:
+            return prefix
+        idx = 2
+        while f"{prefix}_{idx}" in existing:
+            idx += 1
+        return f"{prefix}_{idx}"
+
+    def _next_color(self) -> str:
+        return _DEFAULT_COLORS[len(self._roi_items) % len(_DEFAULT_COLORS)]
+
+    def _new_name_for_shape(self, shape: str) -> str:
+        base = {"rectangle": "ROI_rect", "circle": "ROI_circle", "polygon": "ROI_poly"}.get(shape, "ROI")
+        return self._unique_name(base)
+
+    def _add_roi_item(self, roi: ROIDef) -> QGraphicsItem:
+        item = _roi_to_graphics_item(roi)
+        item.setPen(self._make_pen(roi.color))
+        item.setBrush(self._make_brush(roi.color))
+        item.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, True)
+        item.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, True)
+        item.setFlag(QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges, True)
+        item.setData(0, roi.shape)
+        item.setData(1, roi.name)
+        item.setData(2, roi.color)
+        self._scene.addItem(item)
+        self._roi_items.append(item)
+        return item
+
+    def _create_draft_item(self, start: QPointF, end: QPointF) -> None:
+        color = self._next_color()
+        if self._current_shape == "circle":
+            item: QGraphicsItem = QGraphicsEllipseItem()
+        else:
+            item = QGraphicsRectItem()
+        item.setPen(self._make_pen(color, dashed=True))
+        item.setBrush(self._make_brush(color, alpha=28))
+        self._scene.addItem(item)
+        self._draft_item = item
+        self._update_draft_item(start, end)
+
+    def _update_draft_item(self, start: QPointF, end: QPointF) -> None:
+        rect = QRectF(start, end).normalized()
+        if self._draft_item is None:
+            return
+        if isinstance(self._draft_item, (QGraphicsRectItem, QGraphicsEllipseItem)):
+            self._draft_item.setRect(rect)
+
+    def _update_polygon_preview(self, cursor_pos: QPointF) -> None:
+        if self._draft_item is not None and isinstance(self._draft_item, QGraphicsPolygonItem):
+            self._scene.removeItem(self._draft_item)
+            self._draft_item = None
+        if not self._draft_points:
+            return
+        points = list(self._draft_points) + [cursor_pos]
+        poly = QPolygonF(points)
+        item = QGraphicsPolygonItem(poly)
+        item.setPen(self._make_pen(self._next_color(), dashed=True))
+        item.setBrush(Qt.BrushStyle.NoBrush)
+        self._scene.addItem(item)
+        self._draft_item = item
+
+    def _finalize_drawn_shape(self, start: QPointF, end: QPointF) -> None:
+        rect = QRectF(start, end).normalized()
+        if self._draft_item is not None:
+            self._scene.removeItem(self._draft_item)
+            self._draft_item = None
+        if rect.width() < 3 or rect.height() < 3:
+            return
+        color = self._next_color()
+        if self._current_shape == "circle":
+            roi = ROIDef(
+                name=self._new_name_for_shape("circle"),
+                shape="circle",
+                cx=rect.center().x(),
+                cy=rect.center().y(),
+                radius=min(rect.width(), rect.height()) / 2.0,
+                color=color,
+            )
+        else:
+            roi = ROIDef(
+                name=self._new_name_for_shape("rectangle"),
+                shape="rectangle",
+                cx=rect.center().x(),
+                cy=rect.center().y(),
+                width=rect.width(),
+                height=rect.height(),
+                color=color,
+            )
+        self._add_roi_item(roi).setSelected(True)
+
+    def _finalize_polygon(self) -> None:
+        if len(self._draft_points) < 3:
+            self._clear_draft()
+            return
+        roi = ROIDef(
+            name=self._new_name_for_shape("polygon"),
+            shape="polygon",
+            points=[(pt.x(), pt.y()) for pt in self._draft_points],
+            color=self._next_color(),
+        )
+        if self._draft_item is not None:
+            self._scene.removeItem(self._draft_item)
+            self._draft_item = None
+        self._draft_points = []
+        self._add_roi_item(roi).setSelected(True)
+
+    def _clear_draft(self) -> None:
+        self._drawing = False
+        self._draft_points = []
+        if self._draft_item is not None:
+            self._scene.removeItem(self._draft_item)
+            self._draft_item = None
+
+    def _item_to_roi(self, item: QGraphicsItem) -> ROIDef:
+        shape = item.data(0)
+        name = item.data(1) or self._new_name_for_shape(shape)
+        color = item.data(2) or self._next_color()
+        if shape == "rectangle" and isinstance(item, QGraphicsRectItem):
+            rect = item.rect()
+            return ROIDef(
+                name=name,
+                shape="rectangle",
+                cx=item.scenePos().x(),
+                cy=item.scenePos().y(),
+                width=rect.width(),
+                height=rect.height(),
+                color=color,
+            )
+        if shape == "circle" and isinstance(item, QGraphicsEllipseItem):
+            rect = item.rect()
+            return ROIDef(
+                name=name,
+                shape="circle",
+                cx=item.scenePos().x(),
+                cy=item.scenePos().y(),
+                radius=min(rect.width(), rect.height()) / 2.0,
+                color=color,
+            )
+        if isinstance(item, QGraphicsPolygonItem):
+            points = [(item.mapToScene(pt).x(), item.mapToScene(pt).y()) for pt in item.polygon()]
+            return ROIDef(name=name, shape="polygon", points=points, color=color)
+        return ROIDef(name=name, shape="rectangle", color=color)
+
+
+def _roi_to_graphics_item(roi: ROIDef) -> QGraphicsItem:
+    """Create a centered graphics item from an ROI definition."""
+    if roi.shape == "circle":
+        item = QGraphicsEllipseItem(-roi.radius, -roi.radius, roi.radius * 2.0, roi.radius * 2.0)
+        item.setPos(roi.cx, roi.cy)
+        return item
+    if roi.shape == "rectangle":
+        item = QGraphicsRectItem(-roi.width / 2.0, -roi.height / 2.0, roi.width, roi.height)
+        item.setPos(roi.cx, roi.cy)
+        return item
+
+    points = roi.points or []
+    if not points:
+        item = QGraphicsPolygonItem(QPolygonF())
+        item.setPos(0.0, 0.0)
+        return item
+    cx = float(np.mean([p[0] for p in points]))
+    cy = float(np.mean([p[1] for p in points]))
+    poly = QPolygonF([QPointF(x - cx, y - cy) for x, y in points])
+    item = QGraphicsPolygonItem(poly)
+    item.setPos(cx, cy)
+    return item

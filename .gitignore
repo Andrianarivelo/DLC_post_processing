@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+.pytest_cache/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# User settings written at runtime
+.dlc_processor/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# DLC processor outputs (don't commit generated analysis)
+*_glm_ready.csv
+*_glm_ready.h5
+*_metrics_behavior.csv
+*_behavior_summary.csv
+*_identity_swapped.csv
+*_renamed.csv
+*_mask_identity_cleaned.csv
+*.dlcproj
+
+# Keep the curated demo data, ignore stray large media elsewhere
+/*.mp4
+/*.avi
+!example_data/*.mp4

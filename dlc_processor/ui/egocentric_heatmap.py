@@ -57,6 +57,7 @@ class EgocentricHeatmapDialog(QDialog):
         animal_dfs: dict,
         fps: float = 25.0,
         current_frame: int = 0,
+        px_per_cm: float = 0.0,
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
@@ -67,6 +68,7 @@ class EgocentricHeatmapDialog(QDialog):
         self._animal_dfs = animal_dfs
         self._fps = fps
         self._current_frame = current_frame
+        self._px_per_cm = float(max(px_per_cm, 0.0))
         self._animals = list(animal_dfs.keys())
 
         # Persistent overlay items
@@ -105,14 +107,20 @@ class EgocentricHeatmapDialog(QDialog):
         ctrl_lay.addRow("Other animal:", self._combo_other)
 
         self._spin_radius = QSpinBox()
+        self._spin_radius.setToolTip("Radius of the egocentric map around the focal animal")
         self._spin_radius.setRange(50, 2000)
-        self._spin_radius.setValue(_DEFAULT_RADIUS)
-        self._spin_radius.setSuffix(" px")
+        if self._px_per_cm > 0:
+            self._spin_radius.setValue(max(1, int(round(_DEFAULT_RADIUS / self._px_per_cm))))
+            self._spin_radius.setSuffix(" cm")
+        else:
+            self._spin_radius.setValue(_DEFAULT_RADIUS)
+            self._spin_radius.setSuffix(" px")
         ctrl_lay.addRow("Radius:", self._spin_radius)
 
         self._spin_bins = QSpinBox()
         self._spin_bins.setRange(20, 200)
         self._spin_bins.setValue(_DEFAULT_BINS)
+        self._spin_bins.setToolTip("Resolution of the heatmap grid (higher = finer detail, slower)")
         ctrl_lay.addRow("Grid bins:", self._spin_bins)
 
         self._spin_rings = QSpinBox()
@@ -298,7 +306,11 @@ class EgocentricHeatmapDialog(QDialog):
             return
 
         # Compute 2D histogram
-        radius = self._spin_radius.value()
+        radius = (
+            self._spin_radius.value() * self._px_per_cm
+            if self._px_per_cm > 0
+            else self._spin_radius.value()
+        )
         bins = self._spin_bins.value()
         edges = np.linspace(-radius, radius, bins + 1)
 
@@ -314,6 +326,7 @@ class EgocentricHeatmapDialog(QDialog):
             "end_frame": int(start + n),
             "window_frames": int(window),
             "radius_px": int(radius),
+            "radius_cm": float(radius / self._px_per_cm) if self._px_per_cm > 0 else np.nan,
             "bins": int(bins),
             "n_points": int(len(ego_x)),
             "fps": float(self._fps),
@@ -376,6 +389,7 @@ class EgocentricHeatmapDialog(QDialog):
 
     # ── Polar grid annotations ───────────────────────────────────────────────
 
+    # Export
     def _clear_export_cache(self) -> None:
         """Drop cached export data so failed recomputes cannot export stale results."""
         self._last_ego_x = None
@@ -431,6 +445,10 @@ class EgocentricHeatmapDialog(QDialog):
             "hist_density": self._last_H,
             "bin_edges_px": self._last_edges,
         }
+        if self._px_per_cm > 0:
+            payload["ego_x_cm"] = self._last_ego_x / self._px_per_cm
+            payload["ego_y_cm"] = self._last_ego_y / self._px_per_cm
+            payload["bin_edges_cm"] = self._last_edges / self._px_per_cm
         for key, value in self._last_meta.items():
             payload[f"meta_{key}"] = np.asarray(value)
         np.savez_compressed(out_file, **payload)
@@ -442,24 +460,46 @@ class EgocentricHeatmapDialog(QDialog):
         heatmap_path = base.with_name(f"{base.stem}_heatmap.csv")
         meta_path = base.with_name(f"{base.stem}_meta.csv")
 
-        point_rows = np.column_stack([self._last_ego_x, self._last_ego_y])
+        headers = ["ego_x_px", "ego_y_px"]
+        arrays = [self._last_ego_x, self._last_ego_y]
+        if self._px_per_cm > 0:
+            headers.extend(["ego_x_cm", "ego_y_cm"])
+            arrays.extend([self._last_ego_x / self._px_per_cm, self._last_ego_y / self._px_per_cm])
+        point_rows = np.column_stack(arrays)
         np.savetxt(
             points_path,
             point_rows,
             delimiter=",",
-            header="ego_x_px,ego_y_px",
+            header=",".join(headers),
             comments="",
         )
 
         centers = (self._last_edges[:-1] + self._last_edges[1:]) / 2
         grid_x, grid_y = np.meshgrid(centers, centers, indexing="ij")
         valid = np.isfinite(self._last_H)
-        heat_rows = np.column_stack([grid_x[valid], grid_y[valid], self._last_H[valid]])
+        heat_headers = ["ego_x_center_px", "ego_y_center_px", "density"]
+        heat_arrays = [grid_x[valid], grid_y[valid], self._last_H[valid]]
+        if self._px_per_cm > 0:
+            heat_headers = [
+                "ego_x_center_px",
+                "ego_y_center_px",
+                "ego_x_center_cm",
+                "ego_y_center_cm",
+                "density",
+            ]
+            heat_arrays = [
+                grid_x[valid],
+                grid_y[valid],
+                grid_x[valid] / self._px_per_cm,
+                grid_y[valid] / self._px_per_cm,
+                self._last_H[valid],
+            ]
+        heat_rows = np.column_stack(heat_arrays)
         np.savetxt(
             heatmap_path,
             heat_rows,
             delimiter=",",
-            header="ego_x_center_px,ego_y_center_px,density",
+            header=",".join(heat_headers),
             comments="",
         )
 
@@ -469,6 +509,7 @@ class EgocentricHeatmapDialog(QDialog):
             for key, value in self._last_meta.items():
                 writer.writerow([key, value])
 
+    # Polar grid annotations
     def _draw_polar_grid(self, radius: float) -> None:
         """Draw concentric distance rings, radial lines, and angle labels."""
         vb = self._pw.getViewBox()
@@ -497,7 +538,11 @@ class EgocentricHeatmapDialog(QDialog):
             # Distance label — place at ~45° (upper-right)
             lx = r * np.cos(np.radians(45))
             ly = r * np.sin(np.radians(45))
-            label = pg.TextItem(f"{int(r)} px", color=_GRID_TEXT_COLOR, anchor=(0, 1))
+            if self._px_per_cm > 0:
+                label_text = f"{r / self._px_per_cm:.1f} cm"
+            else:
+                label_text = f"{int(r)} px"
+            label = pg.TextItem(label_text, color=_GRID_TEXT_COLOR, anchor=(0, 1))
             label.setFont(_grid_font())
             label.setPos(lx, ly)
             vb.addItem(label)

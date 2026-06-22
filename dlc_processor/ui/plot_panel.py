@@ -1,4 +1,11 @@
-"""Interactive plot panel: metric time series + behaviour lanes."""
+"""Interactive plot panel: metric time series + behaviour Gantt chart.
+
+Layout
+------
+  toolbar:  [Metrics...] [Animal ▾] [Follow] [Auto Y] [Reset] [Export]
+  splitter: metric plot  (hideable)
+            gantt chart  (hideable)
+"""
 
 from __future__ import annotations
 
@@ -6,12 +13,20 @@ from typing import Optional
 
 import numpy as np
 import pyqtgraph as pg
-from PySide6.QtCore import QRectF, Qt, Signal
+from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QAction, QBrush, QColor, QPen
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
+    QFileDialog,
+    QGridLayout,
+    QGroupBox,
+    QGraphicsRectItem,
     QHBoxLayout,
     QLabel,
+    QMenu,
     QPushButton,
     QScrollArea,
     QSplitter,
@@ -46,20 +61,44 @@ _GANTT_COLORS = [
 
 _METRIC_COLUMNS = [
     "body_speed_px_s",
+    "body_speed_cm_s",
     "body_accel_px_s2",
     "body_jerk_px_s3",
     "body_orientation_deg",
     "body_angle_rate_deg_fr",
     "distance_traveled_px",
+    "distance_traveled_cm",
     "path_tortuosity",
     "body_elongation_px",
     "trajectory_curvature_1_px",
     "head_direction_deg",
     "heading_body_angle_diff_deg",
     "inter_animal_dist_px",
+    "inter_animal_dist_cm",
     "approach_speed_px_s",
     "relative_heading_deg",
+    "partner_distance_px",
+    "partner_distance_cm",
+    "partner_angle_deg",
+    "partner_proximity_index",
 ]
+
+# ── Toolbar button stylesheet ─────────────────────────────────────────────────
+
+_BTN_QSS = (
+    "color: #cdd6f4; background: #313244; border: 1px solid #45475a;"
+    " border-radius: 4px; padding: 2px 10px; font-size: 11px;"
+)
+
+_BTN_ACTIVE_QSS = (
+    "color: #1e1e2e; background: #cba6f7; border: 1px solid #cba6f7;"
+    " border-radius: 4px; padding: 2px 10px; font-size: 11px; font-weight: 600;"
+)
+
+_MENU_QSS = (
+    "QMenu { background: #1e1e2e; color: #cdd6f4; border: 1px solid #313244; }"
+    "QMenu::item:selected { background: #313244; }"
+)
 
 
 class PlotPanel(QWidget):
@@ -67,12 +106,16 @@ class PlotPanel(QWidget):
 
     cursor_moved = Signal(int)
     cleaning_region_changed = Signal(int, int)
+    range_start_flag_requested = Signal(int)
+    range_end_flag_requested = Signal(int)
+    range_clear_requested = Signal()
+    identity_swap_requested = Signal()
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self._animal_dfs: dict = {}
         self._behavior_arrays: dict = {}
-        self._fps: float = 25.0
+        self._fps: float = 30.0
         self._n_frames: int = 0
         self._current_frame: int = 0
         self._follow_playback: bool = True
@@ -80,11 +123,13 @@ class PlotPanel(QWidget):
         self._cleaning_range: tuple[int, int] = (0, 0)
         self._cleaning_region: Optional[pg.LinearRegionItem] = None
         self._cleaning_region_gantt: Optional[pg.LinearRegionItem] = None
-        self._metric_checks: dict[str, QCheckBox] = {}
+        self._custom_time = None  # Optional np.ndarray of timestamps
+        self._metric_checks: dict[str, bool] = {}  # col -> checked
         self._metric_full_series: dict[str, tuple[np.ndarray, str]] = {}
         self._metric_curves: dict[str, pg.PlotDataItem] = {}
         self._metric_view_signature: Optional[tuple] = None
         self._updating_metric_view: bool = False
+        self._gantt_labels: list[pg.TextItem] = []  # floating lane labels
         self._setup_ui()
 
     def _setup_ui(self) -> None:
@@ -99,65 +144,104 @@ class PlotPanel(QWidget):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
+        # ── Toolbar ──────────────────────────────────────────────────────────
         toolbar = QWidget()
-        toolbar.setStyleSheet("background: #181825; border-bottom: 1px solid #313244;")
-        tb_lay = QHBoxLayout(toolbar)
-        tb_lay.setContentsMargins(6, 2, 6, 2)
-        tb_lay.setSpacing(6)
+        toolbar.setFixedHeight(32)
+        toolbar.setStyleSheet(
+            "background: #181825; border-bottom: 1px solid #313244;"
+        )
+        tb = QHBoxLayout(toolbar)
+        tb.setContentsMargins(8, 0, 8, 0)
+        tb.setSpacing(6)
 
-        lbl = QLabel("Metrics:")
-        lbl.setStyleSheet("color: #a6adc8; font-size: 11px; font-weight: 600;")
-        tb_lay.addWidget(lbl)
+        # Metrics popup button
+        self._btn_metrics = QPushButton("Metrics\u2026")
+        self._btn_metrics.setFixedHeight(24)
+        self._btn_metrics.setStyleSheet(_BTN_QSS)
+        self._btn_metrics.setToolTip("Choose which metrics to plot")
+        self._btn_metrics.clicked.connect(self._open_metric_selector)
+        tb.addWidget(self._btn_metrics)
 
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setMaximumHeight(30)
-        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        chk_container = QWidget()
-        self._metric_checks_layout = QHBoxLayout(chk_container)
-        self._metric_checks_layout.setContentsMargins(0, 0, 0, 0)
-        self._metric_checks_layout.setSpacing(4)
-        for col in _METRIC_COLUMNS:
-            self._ensure_metric_checkbox(col)
-        self._metric_checks_layout.addStretch()
-        scroll.setWidget(chk_container)
-        tb_lay.addWidget(scroll, 1)
+        # Active metric summary label
+        self._lbl_active = QLabel("none selected")
+        self._lbl_active.setStyleSheet("color: #6c7086; font-size: 10px;")
+        tb.addWidget(self._lbl_active)
 
-        tb_lay.addWidget(QLabel("Animal:"))
+        tb.addStretch()
+
+        # Animal selector
+        lbl_a = QLabel("Animal:")
+        lbl_a.setStyleSheet("color: #a6adc8; font-size: 11px;")
+        tb.addWidget(lbl_a)
         self._combo_animal = QComboBox()
         self._combo_animal.setMinimumWidth(96)
+        self._combo_animal.setFixedHeight(22)
         self._combo_animal.currentIndexChanged.connect(self._refresh_metric_plot)
-        tb_lay.addWidget(self._combo_animal)
+        tb.addWidget(self._combo_animal)
 
+        tb.addSpacing(8)
+
+        # Follow / Auto Y
         self._chk_follow = QCheckBox("Follow")
         self._chk_follow.setChecked(True)
         self._chk_follow.setStyleSheet("color: #cdd6f4; font-size: 10px;")
+        self._chk_follow.setToolTip("Auto-scroll the plot to follow the video playback cursor")
         self._chk_follow.toggled.connect(self._on_follow_toggled)
-        tb_lay.addWidget(self._chk_follow)
+        tb.addWidget(self._chk_follow)
 
         self._chk_auto_y = QCheckBox("Auto Y")
         self._chk_auto_y.setChecked(True)
         self._chk_auto_y.setStyleSheet("color: #cdd6f4; font-size: 10px;")
-        self._chk_auto_y.toggled.connect(lambda _checked: self._update_metric_view(force=True))
-        tb_lay.addWidget(self._chk_auto_y)
+        self._chk_auto_y.setToolTip("Automatically scale the Y axis to fit visible data")
+        self._chk_auto_y.toggled.connect(lambda _: self._update_metric_view(force=True))
+        tb.addWidget(self._chk_auto_y)
+
+        tb.addSpacing(4)
+
+        # Show/hide toggles for sub-panels
+        self._btn_toggle_metric = QPushButton("Metric")
+        self._btn_toggle_metric.setFixedHeight(22)
+        self._btn_toggle_metric.setCheckable(True)
+        self._btn_toggle_metric.setChecked(True)
+        self._btn_toggle_metric.setStyleSheet(_BTN_ACTIVE_QSS)
+        self._btn_toggle_metric.setToolTip("Show / hide the metric time-series plot")
+        self._btn_toggle_metric.toggled.connect(self._toggle_metric_panel)
+        tb.addWidget(self._btn_toggle_metric)
+
+        self._btn_toggle_gantt = QPushButton("Gantt")
+        self._btn_toggle_gantt.setFixedHeight(22)
+        self._btn_toggle_gantt.setCheckable(True)
+        self._btn_toggle_gantt.setChecked(True)
+        self._btn_toggle_gantt.setStyleSheet(_BTN_ACTIVE_QSS)
+        self._btn_toggle_gantt.setToolTip("Show / hide the behaviour Gantt chart")
+        self._btn_toggle_gantt.toggled.connect(self._toggle_gantt_panel)
+        tb.addWidget(self._btn_toggle_gantt)
+
+        tb.addSpacing(4)
 
         btn_reset = QPushButton("Reset")
-        btn_reset.setToolTip("Reset plot view")
-        btn_reset.setFixedHeight(24)
-        btn_reset.setStyleSheet(
-            "color: #cdd6f4; background: #313244; border: 1px solid #45475a;"
-            " border-radius: 4px; padding: 0 8px;"
-        )
+        btn_reset.setToolTip("Reset plot view to default zoom")
+        btn_reset.setFixedHeight(22)
+        btn_reset.setStyleSheet(_BTN_QSS)
         btn_reset.clicked.connect(self._reset_zoom)
-        tb_lay.addWidget(btn_reset)
+        tb.addWidget(btn_reset)
+
+        btn_export = QPushButton("Export")
+        btn_export.setToolTip("Export plot as PNG or SVG")
+        btn_export.setFixedHeight(22)
+        btn_export.setStyleSheet(_BTN_QSS)
+        btn_export.clicked.connect(self._export_plot)
+        tb.addWidget(btn_export)
 
         root.addWidget(toolbar)
 
-        splitter = QSplitter(Qt.Orientation.Vertical)
-        splitter.setStyleSheet("QSplitter::handle { background: #313244; height: 3px; }")
+        # ── Plots ────────────────────────────────────────────────────────────
+        self._splitter = QSplitter(Qt.Orientation.Vertical)
+        self._splitter.setStyleSheet(
+            "QSplitter::handle { background: #313244; height: 3px; }"
+        )
 
+        # Metric plot
         self._metric_plot = pg.PlotWidget()
         self._metric_plot.setLabel("bottom", "Frame")
         self._metric_plot.setLabel("left", "Value")
@@ -169,40 +253,89 @@ class PlotPanel(QWidget):
         self._metric_plot.getPlotItem().getViewBox().sigRangeChangedManually.connect(
             self._on_manual_zoom
         )
+        self._metric_plot.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._metric_plot.customContextMenuRequested.connect(self._show_plot_context_menu)
         self._metric_plot.scene().sigMouseClicked.connect(self._on_metric_click)
         self._cursor_line_metric = pg.InfiniteLine(
-            pos=0,
-            angle=90,
+            pos=0, angle=90,
             pen=pg.mkPen("#f9e2af", width=1, style=Qt.PenStyle.DashLine),
         )
         self._metric_marker = pg.ScatterPlotItem(size=7, pen=pg.mkPen("#11111b", width=1))
         self._metric_plot.addItem(self._cursor_line_metric)
         self._metric_plot.addItem(self._metric_marker)
-        splitter.addWidget(self._metric_plot)
+        self._splitter.addWidget(self._metric_plot)
 
+        # Gantt chart
         self._gantt_widget = pg.PlotWidget()
         self._gantt_widget.setLabel("bottom", "Frame")
         self._gantt_widget.setLabel("left", "")
         self._gantt_widget.showGrid(x=True, y=False, alpha=0.14)
         self._gantt_widget.getPlotItem().getViewBox().setMouseMode(pg.ViewBox.RectMode)
         self._gantt_widget.getPlotItem().getViewBox().invertY(True)
+        self._gantt_widget.getPlotItem().getViewBox().sigRangeChanged.connect(
+            self._update_gantt_label_positions
+        )
         self._gantt_widget.scene().sigMouseClicked.connect(self._on_gantt_click)
+        self._gantt_widget.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._gantt_widget.customContextMenuRequested.connect(self._show_gantt_context_menu)
         self._cursor_line_gantt = pg.InfiniteLine(
-            pos=0,
-            angle=90,
+            pos=0, angle=90,
             pen=pg.mkPen("#f9e2af", width=1, style=Qt.PenStyle.DashLine),
         )
         self._gantt_widget.addItem(self._cursor_line_gantt)
         self._gantt_widget.setXLink(self._metric_plot)
-        splitter.addWidget(self._gantt_widget)
+        self._splitter.addWidget(self._gantt_widget)
 
-        splitter.setSizes([230, 170])
-        root.addWidget(splitter, 1)
+        self._splitter.setSizes([230, 170])
+        root.addWidget(self._splitter, 1)
 
-        if "body_speed_px_s" in self._metric_checks:
-            self._metric_checks["body_speed_px_s"].setChecked(True)
+        # Pre-populate known metrics (all unchecked by default)
+        for col in _METRIC_COLUMNS:
+            if col not in self._metric_checks:
+                self._metric_checks[col] = False
+        self._update_ui_state()
 
-    def set_animal_dfs(self, dfs: dict, fps: float = 25.0) -> None:
+    # ── Panel toggles ────────────────────────────────────────────────────────
+
+    def _toggle_metric_panel(self, visible: bool) -> None:
+        self._metric_plot.setVisible(visible)
+        self._btn_toggle_metric.setStyleSheet(
+            _BTN_ACTIVE_QSS if visible else _BTN_QSS
+        )
+
+    def _toggle_gantt_panel(self, visible: bool) -> None:
+        self._gantt_widget.setVisible(visible)
+        self._btn_toggle_gantt.setStyleSheet(
+            _BTN_ACTIVE_QSS if visible else _BTN_QSS
+        )
+
+    # ── Metric selector dialog ───────────────────────────────────────────────
+
+    def _open_metric_selector(self) -> None:
+        dlg = _MetricSelectorDialog(self._metric_checks, parent=self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self._metric_checks = dlg.result_checks()
+            self._update_active_label()
+            self._refresh_metric_plot()
+
+    def _update_active_label(self) -> None:
+        active = [_short_name(c) for c, v in self._metric_checks.items() if v]
+        if not active:
+            self._lbl_active.setText("none selected")
+        elif len(active) <= 3:
+            self._lbl_active.setText(", ".join(active))
+        else:
+            self._lbl_active.setText(f"{', '.join(active[:2])} +{len(active)-2} more")
+
+    # ── Public API ───────────────────────────────────────────────────────────
+
+    def set_custom_time(self, times) -> None:
+        self._custom_time = times
+        label = "Frame (external time loaded)" if times is not None else "Frame"
+        self._metric_plot.setLabel("bottom", label)
+        self._gantt_widget.setLabel("bottom", label)
+
+    def set_animal_dfs(self, dfs: dict, fps: float = 30.0) -> None:
         self._animal_dfs = dfs
         self._fps = fps
         self._n_frames = max((len(df) for df in dfs.values()), default=0)
@@ -221,9 +354,16 @@ class PlotPanel(QWidget):
         if dfs:
             first_df = next(iter(dfs.values()))
             for col in first_df.columns:
-                if col.endswith(("_px_s", "_px_s2", "_px_s3", "_px", "_deg", "_deg_fr", "_1_px")):
-                    self._ensure_metric_checkbox(col)
+                if col.endswith((
+                    "_px_s", "_px_s2", "_px_s3", "_px", "_deg", "_deg_fr", "_1_px",
+                    "_cm_s", "_cm_s2", "_cm_s3", "_cm", "_1_cm",
+                )):
+                    if col not in self._metric_checks:
+                        self._metric_checks[col] = False
+            self._ensure_default_metric_selected(first_df)
 
+        self._update_active_label()
+        self._update_ui_state()
         self._refresh_metric_plot()
         self._refresh_gantt()
 
@@ -231,9 +371,37 @@ class PlotPanel(QWidget):
         self._behavior_arrays = arrays
         for name, arr in arrays.items():
             if not _is_boolean_like(arr):
-                self._ensure_metric_checkbox(name, checked=False)
+                if name not in self._metric_checks:
+                    self._metric_checks[name] = False
+        self._update_ui_state()
         self._refresh_gantt()
         self._refresh_metric_plot()
+
+    def _ensure_default_metric_selected(self, df) -> None:
+        if any(self._metric_checks.values()):
+            return
+        for candidate in (
+            "body_speed_cm_s",
+            "body_speed_px_s",
+            "distance_traveled_cm",
+            "distance_traveled_px",
+            "body_orientation_deg",
+        ):
+            if candidate in df.columns:
+                self._metric_checks[candidate] = True
+                return
+
+    def _update_ui_state(self) -> None:
+        has_animals = bool(self._animal_dfs)
+        has_any_plot = has_animals or bool(self._behavior_arrays)
+        self._btn_metrics.setEnabled(has_animals)
+        self._combo_animal.setEnabled(has_animals)
+        self._chk_follow.setEnabled(has_animals)
+        self._chk_auto_y.setEnabled(has_animals)
+        self._btn_toggle_metric.setEnabled(has_any_plot)
+        self._btn_toggle_gantt.setEnabled(bool(self._behavior_arrays))
+        if not has_animals:
+            self._lbl_active.setText("load data to plot")
 
     def set_frame_cursor(self, frame_idx: int) -> None:
         self._current_frame = frame_idx
@@ -252,16 +420,16 @@ class PlotPanel(QWidget):
         if window < 2:
             self._set_default_x_range(center_on=frame_idx)
             return
-
         if window > target_window * 1.5:
             self._set_default_x_range(center_on=frame_idx)
             return
-
         if frame_idx < xmin + window * 0.15 or frame_idx > xmin + window * 0.85:
             new_xmin = frame_idx - window * 0.2
             max_xmin = max(0.0, self._n_frames - window)
             new_xmin = float(np.clip(new_xmin, 0.0, max_xmin))
             self._metric_plot.setXRange(new_xmin, new_xmin + window, padding=0)
+
+    # ── Refresh plots ────────────────────────────────────────────────────────
 
     def _refresh_metric_plot(self) -> None:
         prev_range = self._metric_plot.getPlotItem().getViewBox().viewRange()
@@ -287,8 +455,8 @@ class PlotPanel(QWidget):
         legend = None
         color_idx = 0
 
-        for col, chk in self._metric_checks.items():
-            if not chk.isChecked():
+        for col, checked in self._metric_checks.items():
+            if not checked:
                 continue
             y = self._metric_array_for(col, aid)
             if y is None:
@@ -344,48 +512,84 @@ class PlotPanel(QWidget):
         names = [name for name, _arr in bool_behaviors]
         width = max((len(arr) for _name, arr in bool_behaviors), default=self._n_frames)
         width = max(width, self._n_frames, 1)
-        image = np.zeros((len(names), width, 4), dtype=np.uint8)
+        n_rows = len(names)
 
+        # Draw behaviour bouts as explicit bars so sparse events stay readable.
+        no_pen = QPen(Qt.PenStyle.NoPen)
+        lane_span = float(width)
         for row_idx, (_name, arr) in enumerate(bool_behaviors):
-            rgba = np.array(_GANTT_COLORS[row_idx % len(_GANTT_COLORS)], dtype=np.uint8)
-            base = rgba.copy()
-            base[3] = 34
-            active = rgba.copy()
-            active[3] = 188
-            image[row_idx, :, :] = base
-            if len(arr):
-                image[row_idx, : len(arr), :][arr] = active
+            r, g, b, _a = _GANTT_COLORS[row_idx % len(_GANTT_COLORS)]
+            bg = QGraphicsRectItem(0.0, row_idx - 0.36, lane_span, 0.72)
+            bg.setBrush(QBrush(QColor(r, g, b, 24)))
+            bg.setPen(no_pen)
+            bg.setZValue(0)
+            self._gantt_widget.addItem(bg)
 
-        gantt_image = pg.ImageItem(image)
-        gantt_image.setRect(QRectF(0, -0.5, width, len(names)))
-        self._gantt_widget.addItem(gantt_image)
+            for start, stop in _bool_bouts(arr):
+                if stop <= start:
+                    continue
+                rect = QGraphicsRectItem(float(start), row_idx - 0.34, float(stop - start), 0.68)
+                rect.setBrush(QBrush(QColor(r, g, b, 215)))
+                rect.setPen(no_pen)
+                rect.setZValue(10)
+                self._gantt_widget.addItem(rect)
 
-        # Color squares next to labels — small coloured scatter at x=0
-        sq_y = np.arange(len(names), dtype=float)
-        sq_brushes = [
-            pg.mkBrush(*_GANTT_COLORS[i % len(_GANTT_COLORS)])
-            for i in range(len(names))
-        ]
-        squares = pg.ScatterPlotItem(
-            x=np.zeros(len(names)), y=sq_y,
-            size=10, symbol="s", pen=pg.mkPen(None), brush=sq_brushes,
-        )
-        squares.setZValue(10)
-        self._gantt_widget.addItem(squares)
+        # Lane separator lines — subtle but clear
+        for i in range(n_rows + 1):
+            line = pg.InfiniteLine(
+                pos=i - 0.5, angle=0,
+                pen=pg.mkPen("#585b70", width=1, style=Qt.PenStyle.SolidLine),
+            )
+            line.setZValue(5)
+            self._gantt_widget.addItem(line)
 
+        # Y-axis tick labels — plain text (pyqtgraph AxisItem doesn't render HTML)
         axis = self._gantt_widget.getPlotItem().getAxis("left")
-        axis.setTicks([[(row_idx, _short_name(name)) for row_idx, name in enumerate(names)]])
-        self._gantt_widget.setYRange(-0.5, len(names) - 0.5, padding=0.03)
+        axis.setStyle(tickLength=0)
+        axis.setWidth(160)
+        ticks = [(row_idx, _short_name(name)) for row_idx, name in enumerate(names)]
+        axis.setTicks([ticks])
+        axis.setTextPen(pg.mkPen("#cdd6f4"))
+
+        # Colour swatch labels — pinned to left edge of viewport
+        self._gantt_labels = []
+        for row_idx, name in enumerate(names):
+            r, g, b, _a = _GANTT_COLORS[row_idx % len(_GANTT_COLORS)]
+            txt = pg.TextItem(text="\u2588", color=(r, g, b, 220), anchor=(0, 0.5))
+            txt.setFont(pg.QtGui.QFont("sans-serif", 11))
+            txt.setZValue(15)
+            self._gantt_widget.addItem(txt)
+            self._gantt_labels.append(txt)
+
+        self._gantt_widget.setYRange(-0.5, n_rows - 0.5, padding=0.05)
 
         if self._n_frames > 0:
             xmin, xmax = prev_range[0]
             if np.isfinite(xmin) and np.isfinite(xmax) and xmax > xmin:
-                self._gantt_widget.setXRange(max(0.0, xmin), min(float(self._n_frames), xmax), padding=0)
+                self._gantt_widget.setXRange(
+                    max(0.0, xmin), min(float(width), xmax), padding=0
+                )
             else:
-                self._gantt_widget.setXRange(0, self._default_window(), padding=0)
+                self._gantt_widget.setXRange(0, min(float(width), float(self._default_window())), padding=0)
 
         if self._show_cleaning_region:
             self._add_gantt_cleaning_region()
+
+        # Position swatch labels at current view
+        self._update_gantt_label_positions()
+
+    def _update_gantt_label_positions(self, *_args) -> None:
+        """Pin floating lane labels to the left edge of the visible viewport."""
+        if not self._gantt_labels:
+            return
+        vb = self._gantt_widget.getPlotItem().getViewBox()
+        xmin, _xmax = vb.viewRange()[0]
+        # Small offset so text doesn't sit right on the axis edge
+        x_offset = (_xmax - xmin) * 0.005 + xmin
+        for row_idx, txt in enumerate(self._gantt_labels):
+            txt.setPos(x_offset, row_idx)
+
+    # ── Data helpers ─────────────────────────────────────────────────────────
 
     def _metric_array_for(self, col: str, aid: str) -> Optional[np.ndarray]:
         if aid and aid in self._animal_dfs and col in self._animal_dfs[aid].columns:
@@ -394,6 +598,8 @@ class PlotPanel(QWidget):
         if arr is None or _is_boolean_like(arr):
             return None
         return np.asarray(arr, dtype=np.float64)
+
+    # ── Interaction ──────────────────────────────────────────────────────────
 
     def _on_follow_toggled(self, checked: bool) -> None:
         self._follow_playback = checked
@@ -421,6 +627,25 @@ class PlotPanel(QWidget):
             self._chk_follow.blockSignals(False)
         self._set_default_x_range(center_on=self._current_frame)
         self._update_metric_view(force=True)
+
+    def _on_metric_click(self, event) -> None:
+        if hasattr(event, "button") and event.button() != Qt.MouseButton.LeftButton:
+            return
+        self._seek_from_scene(self._metric_plot.getPlotItem().getViewBox(), event.scenePos())
+
+    def _on_gantt_click(self, event) -> None:
+        if hasattr(event, "button") and event.button() != Qt.MouseButton.LeftButton:
+            return
+        self._seek_from_scene(self._gantt_widget.getPlotItem().getViewBox(), event.scenePos())
+
+    def _seek_from_scene(self, view_box: pg.ViewBox, scene_pos) -> None:
+        mouse_point = view_box.mapSceneToView(scene_pos)
+        frame = int(round(mouse_point.x()))
+        if 0 <= frame < self._n_frames:
+            self.set_frame_cursor(frame)
+            self.cursor_moved.emit(frame)
+
+    # ── Cleaning region ──────────────────────────────────────────────────────
 
     def show_cleaning_region(self, start: int = 0, end: int = 0) -> None:
         if start > 0 or end > 0:
@@ -513,18 +738,7 @@ class PlotPanel(QWidget):
         self._cleaning_range = (start, end)
         self.cleaning_region_changed.emit(start, end)
 
-    def _on_metric_click(self, event) -> None:
-        self._seek_from_scene(self._metric_plot.getPlotItem().getViewBox(), event.scenePos())
-
-    def _on_gantt_click(self, event) -> None:
-        self._seek_from_scene(self._gantt_widget.getPlotItem().getViewBox(), event.scenePos())
-
-    def _seek_from_scene(self, view_box: pg.ViewBox, scene_pos) -> None:
-        mouse_point = view_box.mapSceneToView(scene_pos)
-        frame = int(round(mouse_point.x()))
-        if 0 <= frame < self._n_frames:
-            self.set_frame_cursor(frame)
-            self.cursor_moved.emit(frame)
+    # ── View helpers ─────────────────────────────────────────────────────────
 
     def _set_default_x_range(self, center_on: Optional[int] = None) -> None:
         if self._n_frames <= 0:
@@ -612,17 +826,256 @@ class PlotPanel(QWidget):
         else:
             self._metric_marker.setData([], [])
 
-    def _ensure_metric_checkbox(self, col: str, checked: bool = False) -> None:
-        if col in self._metric_checks:
-            return
-        chk = QCheckBox(_short_name(col))
-        chk.setToolTip(col)
-        chk.setChecked(checked)
-        chk.setStyleSheet("color: #cdd6f4; font-size: 10px;")
-        chk.toggled.connect(self._refresh_metric_plot)
-        self._metric_checks[col] = chk
-        idx = max(0, self._metric_checks_layout.count() - 1)
-        self._metric_checks_layout.insertWidget(idx, chk)
+    # ── Context menu ─────────────────────────────────────────────────────────
+
+    def _frame_from_plot_pos(self, plot_widget: pg.PlotWidget, pos) -> int:
+        if self._n_frames <= 0:
+            return int(self._current_frame)
+        view_box = plot_widget.getPlotItem().getViewBox()
+        scene_pos = plot_widget.mapToScene(pos)
+        mouse_point = view_box.mapSceneToView(scene_pos)
+        frame = int(round(mouse_point.x()))
+        return max(0, min(self._n_frames - 1, frame))
+
+    def _add_range_actions_to_menu(self, menu: QMenu, frame: int) -> None:
+        act_start = menu.addAction(f"Set start flag at frame {frame}")
+        act_start.triggered.connect(
+            lambda _checked=False, frame=frame: self.range_start_flag_requested.emit(frame)
+        )
+
+        act_end = menu.addAction(f"Set end flag at frame {frame}")
+        act_end.triggered.connect(
+            lambda _checked=False, frame=frame: self.range_end_flag_requested.emit(frame)
+        )
+
+        menu.addSeparator()
+
+        act_swap = menu.addAction("Swap Mouse Identity")
+        act_swap.triggered.connect(lambda _checked=False: self.identity_swap_requested.emit())
+
+        act_clear = menu.addAction("Clear flagged range")
+        act_clear.triggered.connect(lambda _checked=False: self.range_clear_requested.emit())
+
+    def _show_plot_context_menu(self, pos) -> None:
+        frame = self._frame_from_plot_pos(self._metric_plot, pos)
+        menu = QMenu(self)
+        menu.setStyleSheet(_MENU_QSS)
+
+        self._add_range_actions_to_menu(menu, frame)
+
+        menu.addSeparator()
+
+        act_metrics = QAction("Select metrics\u2026", self)
+        act_metrics.triggered.connect(self._open_metric_selector)
+        menu.addAction(act_metrics)
+
+        menu.addSeparator()
+
+        act_export_png = QAction("Export as PNG\u2026", self)
+        act_export_png.triggered.connect(lambda: self._export_plot("png"))
+        menu.addAction(act_export_png)
+
+        act_export_svg = QAction("Export as SVG\u2026", self)
+        act_export_svg.triggered.connect(lambda: self._export_plot("svg"))
+        menu.addAction(act_export_svg)
+
+        menu.addSeparator()
+
+        act_reset = QAction("Reset view", self)
+        act_reset.triggered.connect(self._reset_zoom)
+        menu.addAction(act_reset)
+
+        menu.exec(self._metric_plot.mapToGlobal(pos))
+
+    def _show_gantt_context_menu(self, pos) -> None:
+        frame = self._frame_from_plot_pos(self._gantt_widget, pos)
+        menu = QMenu(self)
+        menu.setStyleSheet(_MENU_QSS)
+
+        self._add_range_actions_to_menu(menu, frame)
+
+        menu.addSeparator()
+
+        act_reset = QAction("Reset view", self)
+        act_reset.triggered.connect(self._reset_zoom)
+        menu.addAction(act_reset)
+
+        menu.exec(self._gantt_widget.mapToGlobal(pos))
+
+    def _export_plot(self, fmt: str = "") -> None:
+        """Export the metric plot as PNG or SVG."""
+        import pyqtgraph.exporters as exporters
+
+        if not fmt:
+            path, _ = QFileDialog.getSaveFileName(
+                self, "Export Plot", "",
+                "PNG Image (*.png);;SVG Image (*.svg)",
+            )
+            if not path:
+                return
+            fmt = "svg" if path.lower().endswith(".svg") else "png"
+        else:
+            ext = f".{fmt}"
+            filt_map = {"png": "PNG Image (*.png)", "svg": "SVG Image (*.svg)"}
+            path, _ = QFileDialog.getSaveFileName(
+                self, "Export Plot", "", filt_map.get(fmt, ""),
+            )
+            if not path:
+                return
+            if not path.lower().endswith(ext):
+                path += ext
+
+        scene = self._metric_plot.getPlotItem().scene()
+        if fmt == "svg":
+            exporter = exporters.SVGExporter(scene)
+        else:
+            exporter = exporters.ImageExporter(scene)
+            exporter.parameters()["width"] = 1920
+        exporter.export(path)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Metric Selector Dialog
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Categories for the metric selector
+_METRIC_CATEGORIES: list[tuple[str, list[str]]] = [
+    ("Speed & Motion", [
+        "body_speed_px_s", "body_speed_cm_s",
+        "body_accel_px_s2", "body_accel_cm_s2",
+        "body_jerk_px_s3", "body_jerk_cm_s3",
+    ]),
+    ("Distance & Path", [
+        "distance_traveled_px", "distance_traveled_cm",
+        "path_tortuosity",
+    ]),
+    ("Orientation & Posture", [
+        "body_orientation_deg", "body_angle_rate_deg_fr",
+        "head_direction_deg", "heading_body_angle_diff_deg",
+        "body_elongation_px", "body_elongation_cm",
+        "trajectory_curvature_1_px", "trajectory_curvature_1_cm",
+    ]),
+    ("Partner Metrics", [
+        "partner_distance_px", "partner_distance_cm",
+        "partner_angle_deg", "partner_proximity_index",
+        "inter_animal_dist_px", "inter_animal_dist_cm",
+        "approach_speed_px_s", "approach_speed_cm_s",
+        "relative_heading_deg",
+    ]),
+]
+
+
+class _MetricSelectorDialog(QDialog):
+    """Popup dialog with categorised metric checkboxes."""
+
+    def __init__(self, current: dict[str, bool], parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Select Metrics to Plot")
+        self.setMinimumWidth(420)
+        self.setStyleSheet(
+            "QDialog { background: #1e1e2e; color: #cdd6f4; }"
+            "QGroupBox { border: 1px solid #313244; border-radius: 4px;"
+            " margin-top: 8px; padding-top: 14px; font-weight: 600;"
+            " color: #a6adc8; }"
+            "QGroupBox::title { subcontrol-origin: margin;"
+            " subcontrol-position: top left; left: 10px; }"
+            "QCheckBox { color: #cdd6f4; font-size: 11px; padding: 2px 0; }"
+            "QPushButton { color: #cdd6f4; background: #313244;"
+            " border: 1px solid #45475a; border-radius: 4px;"
+            " padding: 4px 14px; }"
+            "QPushButton:hover { background: #45475a; }"
+        )
+        self._checks: dict[str, QCheckBox] = {}
+        self._build_ui(current)
+
+    def _build_ui(self, current: dict[str, bool]) -> None:
+        lay = QVBoxLayout(self)
+        lay.setSpacing(6)
+
+        # Quick actions
+        top = QHBoxLayout()
+        btn_all = QPushButton("All")
+        btn_all.clicked.connect(lambda: self._set_all(True))
+        btn_none = QPushButton("None")
+        btn_none.clicked.connect(lambda: self._set_all(False))
+        top.addWidget(btn_all)
+        top.addWidget(btn_none)
+        top.addStretch()
+        lay.addLayout(top)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        scroll.setMaximumHeight(400)
+        container = QWidget()
+        grid_outer = QVBoxLayout(container)
+        grid_outer.setSpacing(4)
+
+        # Categorised metrics
+        categorised = set()
+        for cat_name, cols in _METRIC_CATEGORIES:
+            grp = QGroupBox(cat_name)
+            g = QGridLayout(grp)
+            g.setSpacing(3)
+            col_idx = 0
+            for c in cols:
+                categorised.add(c)
+                chk = QCheckBox(_short_name(c))
+                chk.setToolTip(c)
+                chk.setChecked(current.get(c, False))
+                self._checks[c] = chk
+                g.addWidget(chk, col_idx // 2, col_idx % 2)
+                col_idx += 1
+            grid_outer.addWidget(grp)
+
+        # Uncategorised (dynamic columns discovered at runtime)
+        uncategorised = [c for c in current if c not in categorised]
+        if uncategorised:
+            grp = QGroupBox("Other")
+            g = QGridLayout(grp)
+            g.setSpacing(3)
+            for i, c in enumerate(uncategorised):
+                chk = QCheckBox(_short_name(c))
+                chk.setToolTip(c)
+                chk.setChecked(current.get(c, False))
+                self._checks[c] = chk
+                g.addWidget(chk, i // 2, i % 2)
+            grid_outer.addWidget(grp)
+
+        grid_outer.addStretch()
+        scroll.setWidget(container)
+        lay.addWidget(scroll, 1)
+
+        # Buttons
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        lay.addWidget(buttons)
+
+    def _set_all(self, checked: bool) -> None:
+        for chk in self._checks.values():
+            chk.setChecked(checked)
+
+    def result_checks(self) -> dict[str, bool]:
+        return {c: chk.isChecked() for c, chk in self._checks.items()}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Module-level helpers
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _bool_bouts(arr: np.ndarray) -> list[tuple[int, int]]:
+    """Return [start, stop) runs for True values."""
+    values = np.asarray(arr, dtype=bool).reshape(-1)
+    if values.size == 0:
+        return []
+    padded = np.concatenate([[False], values, [False]])
+    edges = np.diff(padded.astype(np.int8))
+    starts = np.flatnonzero(edges == 1)
+    stops = np.flatnonzero(edges == -1)
+    return [(int(s), int(e)) for s, e in zip(starts, stops) if e > s]
 
 
 def _visible_series(
@@ -694,37 +1147,98 @@ def _downsample_minmax(
 
 
 def _short_name(col: str) -> str:
+    """Return a clean, print-friendly display name. No arrows or unicode symbols."""
+    if "__" in col:
+        animal, metric = col.split("__", 1)
+        if metric in {"immobile", "is_immobile"}:
+            return f"{animal} immobile"
+        if metric in {"mobile", "is_mobile"}:
+            return f"{animal} mobile"
+        if metric == "mobility_state":
+            return f"{animal} mobility"
     pretty = {
-        "a_nose2anogenital_b": "A\u2192B anogenital",
-        "b_nose2anogenital_a": "B\u2192A anogenital",
-        "a_nose2body_b": "A\u2192B body",
-        "b_nose2body_a": "B\u2192A body",
+        # Social behaviors — NO arrows, plain text
+        "nose2nose": "nose-to-nose",
+        "mask_contact": "mask contact",
+        "fighting": "fighting",
+        "attacks": "attacks",
+        "a_nose2anogenital_b": "A to B anogenital",
+        "b_nose2anogenital_a": "B to A anogenital",
+        "a_nose2body_b": "A to B body",
+        "b_nose2body_a": "B to A body",
         "a_following_b": "A follows B",
         "b_following_a": "B follows A",
-        "a_oriented_toward_b": "A oriented\u2192B",
-        "b_oriented_toward_a": "B oriented\u2192A",
+        "a_chasing_b": "A chases B",
+        "b_chasing_a": "B chases A",
+        "a_approaches_b": "A approaches B",
+        "b_approaches_a": "B approaches A",
+        "a_withdraws_from_b": "A withdraws from B",
+        "b_withdraws_from_a": "B withdraws from A",
+        "a_escapes_b": "A escapes B",
+        "b_escapes_a": "B escapes A",
+        "a_withdrawal_after_contact_b": "A withdraws after contact B",
+        "b_withdrawal_after_contact_a": "B withdraws after contact A",
+        "a_oriented_toward_b": "A oriented to B",
+        "b_oriented_toward_a": "B oriented to A",
+        "sidebyside": "side-by-side",
+        "sidereside": "side-reverse",
         "passive_anogenital": "passive anogenital",
         "passive_investigation": "passive investigation",
         "passive_being_followed": "passive followed",
-        "inter_animal_dist_px": "inter-animal dist",
-        "approach_speed_px_s": "approach speed",
+        "passive_being_chased": "passive chased",
+        "passive_withdrawal": "passive withdrawal",
+        # Social metrics
+        "inter_animal_dist_px": "inter-animal dist (px)",
+        "inter_animal_dist_cm": "inter-animal dist (cm)",
+        "approach_speed_px_s": "approach speed (px/s)",
+        "approach_speed_cm_s": "approach speed (cm/s)",
         "relative_heading_deg": "relative heading",
+        "partner_distance_px": "partner dist (px)",
+        "partner_distance_cm": "partner dist (cm)",
+        "partner_angle_deg": "partner angle",
+        "partner_proximity_index": "proximity index",
+        # Individual
         "rearing": "rearing",
+        "immobile": "immobile",
+        "freezing": "immobile",
+        "is_immobile": "immobile",
+        # Kinematics
+        "body_speed_px_s": "speed (px/s)",
+        "body_speed_cm_s": "speed (cm/s)",
+        "body_accel_px_s2": "accel (px/s2)",
+        "body_accel_cm_s2": "accel (cm/s2)",
+        "body_jerk_px_s3": "jerk (px/s3)",
+        "body_jerk_cm_s3": "jerk (cm/s3)",
+        "body_orientation_deg": "orientation (deg)",
+        "body_angle_rate_deg_fr": "angular vel (deg/fr)",
+        "distance_traveled_px": "cum. distance (px)",
+        "distance_traveled_cm": "cum. distance (cm)",
+        "path_tortuosity": "tortuosity",
+        "body_elongation_px": "elongation (px)",
+        "body_elongation_cm": "elongation (cm)",
+        "trajectory_curvature_1_px": "curvature (1/px)",
+        "trajectory_curvature_1_cm": "curvature (1/cm)",
+        "head_direction_deg": "head direction (deg)",
+        "heading_body_angle_diff_deg": "crab-walk angle",
+        # Mobility
+        "mobility_state": "mobility state",
     }
     if col in pretty:
         return pretty[col]
 
-    return (
-        col.replace("body_", "")
-        .replace("_px_s2", " acc")
-        .replace("_px_s3", " jerk")
-        .replace("_px_s", " speed")
-        .replace("_px", "")
-        .replace("_deg_fr", " deg/fr")
-        .replace("_deg", " deg")
-        .replace("_1_px", " curvature")
-        .replace("_", " ")
-    )
+    # Fallback: strip common suffixes
+    s = col
+    for old, new in [
+        ("_cm_s3", " jerk"), ("_cm_s2", " acc"), ("_cm_s", " speed"),
+        ("_px_s3", " jerk"), ("_px_s2", " acc"), ("_px_s", " speed"),
+        ("_deg_fr", " (deg/fr)"), ("_deg", " (deg)"),
+        ("_1_cm", " curvature"), ("_1_px", " curvature"),
+        ("_cm", " (cm)"), ("_px", " (px)"),
+    ]:
+        if s.endswith(old):
+            s = s[: -len(old)] + new
+            break
+    return s.replace("body_", "").replace("_", " ").strip()
 
 
 def _is_boolean_like(arr: np.ndarray) -> bool:

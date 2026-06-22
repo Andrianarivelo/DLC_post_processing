@@ -306,6 +306,12 @@ class TrackEditorDialog(QDialog):
         btn_del.clicked.connect(self._delete_selected)
         del_lay.addWidget(btn_del)
 
+        btn_drop_bp = QPushButton("Remove Bodypart(s)")
+        btn_drop_bp.setObjectName("danger")
+        btn_drop_bp.setToolTip("Delete the selected bodypart columns from the current animal")
+        btn_drop_bp.clicked.connect(self._delete_bodyparts)
+        del_lay.addWidget(btn_drop_bp)
+
         tools_lay.addWidget(del_group)
 
         # --- Interpolation tool ---
@@ -593,6 +599,30 @@ class TrackEditorDialog(QDialog):
         logger.info("Deleted %d bodyparts in frames %d-%d", len(bps), start, end)
         self._refresh_plots()
 
+    def _delete_bodyparts(self) -> None:
+        """Delete the selected bodypart columns from the current animal."""
+        aid = self._combo_animal.currentText()
+        if aid not in self._working_dfs:
+            return
+        bps = self._selected_bodyparts()
+        if not bps:
+            return
+
+        df = self._working_dfs[aid]
+        drop_cols: list[str] = []
+        for bp in bps:
+            for suffix in ("_x", "_y", "_likelihood"):
+                col = f"{bp}{suffix}"
+                if col in df.columns:
+                    drop_cols.append(col)
+        if not drop_cols:
+            return
+
+        self._working_dfs[aid] = df.drop(columns=drop_cols)
+        logger.info("Removed %d bodypart(s) from animal %s: %s", len(bps), aid, ", ".join(bps))
+        self._populate_bodyparts()
+        self._refresh_plots()
+
     def _interpolate_selected(self) -> None:
         """Interpolate NaN gaps in the selection range."""
         from dlc_processor.core.data_cleaner import _interpolate_with_gap_limit
@@ -730,16 +760,17 @@ class TrackEditorDialog(QDialog):
             return
 
         p = Path(path)
+        written_path = path
         if p.suffix.lower() in (".h5", ".hdf5"):
             from dlc_processor.core.data_cleaner import save_cleaned_h5
-            save_cleaned_h5(self._working_dfs, path)
+            written_path = save_cleaned_h5(self._working_dfs, path)
         elif p.suffix.lower() == ".csv":
             _save_cleaned_csv(self._working_dfs, path)
         else:
             from dlc_processor.core.data_cleaner import save_cleaned_h5
-            save_cleaned_h5(self._working_dfs, path)
+            written_path = save_cleaned_h5(self._working_dfs, path)
 
-        logger.info("Saved cleaned data to %s", path)
+        logger.info("Saved cleaned data to %s", written_path)
 
 
 # ── Auto-fix proximity helpers ──────────────────────────────────────────────

@@ -1,0 +1,39 @@
+# DLC Post-Processing — runtime dependencies (pip)
+# Tested with Python 3.10–3.12.
+#
+#   python -m venv .venv
+#   .venv/Scripts/activate        # Windows
+#   source .venv/bin/activate     # macOS / Linux
+#   pip install -r requirements.txt
+#   python app.py
+
+# ── Core GUI ──────────────────────────────────────────────────────────────────
+PySide6>=6.5
+pyqtgraph>=0.13
+
+# ── Numerics / data ───────────────────────────────────────────────────────────
+numpy>=1.23,<2
+pandas>=1.5
+scipy>=1.10
+
+# ── Plotting (batch summary figures, position maps, transition heatmaps) ───────
+matplotlib>=3.6
+
+# ── Video I/O ─────────────────────────────────────────────────────────────────
+opencv-python>=4.7
+
+# ── Config / project files ────────────────────────────────────────────────────
+PyYAML>=6.0
+
+# ── Optional: HDF5 read/write of DLC .h5 and GLM-ready tables ──────────────────
+# Needed only if you load/save .h5 files. CSV works without these.
+tables>=3.8        # PyTables, enables pandas.to_hdf(format="table")
+h5py>=3.8          # used as an automatic fallback for HDF5 export
+
+# ── Optional: run DeepLabCut inference from inside the app ─────────────────────
+# Heavy (TensorFlow / PyTorch). Install in a dedicated DLC environment instead;
+# the app can also drive inference through a separate conda env via subprocess.
+# deeplabcut
+
+# ── Optional: run the test suite ──────────────────────────────────────────────
+# pytest>=7.0

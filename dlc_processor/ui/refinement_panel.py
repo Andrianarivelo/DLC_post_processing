@@ -46,51 +46,67 @@ class RefinementPanel(QGroupBox):
         frame_row.addStretch()
         layout.addLayout(frame_row)
 
-        # Range marking
+        # --- Frame Range Selection ---
+        range_group = QGroupBox("Frame Range")
+        range_lay = QVBoxLayout(range_group)
+        range_lay.setSpacing(4)
+
         range_row = QHBoxLayout()
         self._btn_from = QPushButton("Mark From")
         self._btn_from.setObjectName("secondary")
+        self._btn_from.setToolTip("Set the start of the swap range to the current frame")
         self._btn_from.clicked.connect(self._mark_from_clicked)
         self._btn_to = QPushButton("Mark To")
         self._btn_to.setObjectName("secondary")
+        self._btn_to.setToolTip("Set the end of the swap range to the current frame")
         self._btn_to.clicked.connect(self._mark_to_clicked)
         self._lbl_range = QLabel("Range: not set")
         range_row.addWidget(self._btn_from)
         range_row.addWidget(self._btn_to)
         range_row.addWidget(self._lbl_range)
         range_row.addStretch()
-        layout.addLayout(range_row)
+        range_lay.addLayout(range_row)
 
-        # Explicit range spinboxes
         spin_row = QHBoxLayout()
         spin_row.addWidget(QLabel("From:"))
         self._spin_from = QSpinBox()
         self._spin_from.setRange(0, 10_000_000)
+        self._spin_from.setToolTip("Start frame of the range (inclusive)")
         spin_row.addWidget(self._spin_from)
         spin_row.addWidget(QLabel("To:"))
         self._spin_to = QSpinBox()
         self._spin_to.setRange(0, 10_000_000)
+        self._spin_to.setToolTip("End frame of the range (inclusive)")
         spin_row.addWidget(self._spin_to)
         spin_row.addStretch()
-        layout.addLayout(spin_row)
+        range_lay.addLayout(spin_row)
+        layout.addWidget(range_group)
 
-        # Animal ID swap
+        # --- Identity Swap ---
+        swap_group = QGroupBox("Identity Swap")
+        swap_lay = QVBoxLayout(swap_group)
+        swap_lay.setSpacing(4)
+
         swap_row = QHBoxLayout()
         swap_row.addWidget(QLabel("Swap:"))
         self._combo_a = QComboBox()
+        self._combo_a.setToolTip("First animal to swap")
         self._combo_b = QComboBox()
+        self._combo_b.setToolTip("Second animal to swap")
         swap_row.addWidget(self._combo_a)
-        swap_row.addWidget(QLabel("↔"))
+        swap_row.addWidget(QLabel("<>"))
         swap_row.addWidget(self._combo_b)
         swap_row.addStretch()
-        layout.addLayout(swap_row)
+        swap_lay.addLayout(swap_row)
 
         btn_swap = QPushButton("Apply Swap")
+        btn_swap.setToolTip("Swap the tracking data of the two selected animals within the frame range")
         btn_swap.clicked.connect(self._apply_swap)
-        layout.addWidget(btn_swap)
+        swap_lay.addWidget(btn_swap)
 
         self._lbl_status = QLabel("")
-        layout.addWidget(self._lbl_status)
+        swap_lay.addWidget(self._lbl_status)
+        layout.addWidget(swap_group)
 
     def set_animal_dfs(self, dfs: dict) -> None:
         self._animal_dfs = dfs
@@ -123,11 +139,11 @@ class RefinementPanel(QGroupBox):
         if f is None and t is None:
             self._lbl_range.setText("Range: not set")
         elif f is not None and t is None:
-            self._lbl_range.setText(f"Range: {f} → ?")
+            self._lbl_range.setText(f"Range: {f} - ?")
         elif f is None and t is not None:
-            self._lbl_range.setText(f"Range: ? → {t}")
+            self._lbl_range.setText(f"Range: ? - {t}")
         else:
-            self._lbl_range.setText(f"Range: {f} → {t}")
+            self._lbl_range.setText(f"Range: {f} - {t}")
 
     def _apply_swap(self) -> None:
         aid_a = self._combo_a.currentText()
@@ -153,6 +169,6 @@ class RefinementPanel(QGroupBox):
         self._animal_dfs[aid_a] = df_a
         self._animal_dfs[aid_b] = df_b
 
-        self._lbl_status.setText(f"✔ Swapped {aid_a} ↔ {aid_b} for frames {fr}–{to}")
+        self._lbl_status.setText(f"Swapped {aid_a} <> {aid_b} for frames {fr}-{to}")
         logger.info("ID swap: %s ↔ %s  frames %d–%d", aid_a, aid_b, fr, to)
         self.data_changed.emit(self._animal_dfs)

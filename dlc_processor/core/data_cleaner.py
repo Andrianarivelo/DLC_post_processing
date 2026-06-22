@@ -5,13 +5,20 @@ Stage 2 — Gap interpolation     : spline-fill gaps up to max_gap_frames long;
                                    longer gaps stay NaN.
 Stage 3 — Smoothing             : Savitzky-Golay filter on x and y columns.
 Stage 4 — Anatomy fix           : correct impossible geometry (nose behind neck, etc.)
+
+Spatial calibration is handled downstream in analysis/export layers so raw
+tracking coordinates remain in pixel space for overlays and ROI geometry.
 """
 
 from __future__ import annotations
 
 import logging
+import os
+import itertools
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Optional
+from pathlib import Path
+from typing import Any, Optional
 
 import numpy as np
 import pandas as pd
@@ -67,7 +74,7 @@ def clean_animal_df(
     sg_window       : Savitzky-Golay window length (must be odd, >= polyorder+2)
     sg_polyorder    : Savitzky-Golay polynomial order
     apply_*         : toggle individual stages
-    px_per_cm       : if > 0, divide all x/y columns to convert px → cm
+    px_per_cm       : deprecated; calibration is no longer applied by cleaning
     start_frame     : if > 0 with end_frame, clean only this sub-range
     end_frame       : end of sub-range (exclusive)
 
@@ -78,10 +85,11 @@ def clean_animal_df(
     out = df.copy()
     bodyparts = get_bodyparts(out)
 
-    # Stage 0: calibration always applies to full range
     if px_per_cm > 0:
-        out = _apply_calibration(out, bodyparts, px_per_cm)
-        logger.debug("Calibration applied (%.2f px/cm)", px_per_cm)
+        logger.warning(
+            "Ignoring px_per_cm during cleaning; calibration now propagates "
+            "through analysis/export without modifying raw coordinates."
+        )
 
     use_range = end_frame > start_frame
     if use_range:
@@ -132,12 +140,27 @@ def clean_all_animals(
     If ``computed_bodyparts`` is in kwargs, derived bodyparts are added first.
     """
     computed_defs = kwargs.pop("computed_bodyparts", None)
-    result = {}
-    for aid, df in animal_dfs.items():
+    max_workers = kwargs.pop("max_workers", None)
+
+    def _clean_one(item: tuple[str, pd.DataFrame]) -> tuple[str, pd.DataFrame]:
+        aid, df = item
         out = df
         if computed_defs:
             out = add_computed_bodyparts(out, computed_defs)
-        result[aid] = clean_animal_df(out, **kwargs)
+        return aid, clean_animal_df(out, **kwargs)
+
+    items = list(animal_dfs.items())
+    if len(items) <= 1:
+        return dict(_clean_one(item) for item in items)
+
+    workers = _resolve_worker_count(max_workers, len(items))
+    if workers <= 1:
+        return dict(_clean_one(item) for item in items)
+
+    result: dict[str, pd.DataFrame] = {}
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        for aid, cleaned in executor.map(_clean_one, items):
+            result[aid] = cleaned
     return result
 
 
@@ -160,6 +183,675 @@ def fix_impossible_all_animals(
         start_frame=start_frame,
         end_frame=end_frame,
     )
+
+
+def fix_identities_from_masks(
+    animal_dfs: dict[str, pd.DataFrame],
+    mask_store: Any,
+    animal_to_track_id: Optional[dict[str, int]] = None,
+    *,
+    exact_masks: bool = True,
+    max_workers: Optional[int] = None,
+) -> tuple[dict[str, pd.DataFrame], dict[str, int]]:
+    """Use mask track IDs as ground truth and repair swapped keypoint rows.
+
+    The fast path scores how many keypoints from each current identity fall
+    inside each mask bbox. When mask bboxes overlap, exact mask pixels are used
+    for that frame so contact frames are still assigned by the real masks.
+    """
+    if not animal_dfs or mask_store is None:
+        return animal_dfs, {"frames_checked": 0, "frames_corrected": 0}
+
+    animals = list(animal_dfs.keys())
+    if len(animals) < 2:
+        return animal_dfs, {"frames_checked": 0, "frames_corrected": 0}
+
+    first_df = next(iter(animal_dfs.values()))
+    n_rows = min(len(df) for df in animal_dfs.values())
+    if n_rows <= 0:
+        return animal_dfs, {"frames_checked": 0, "frames_corrected": 0}
+
+    track_map = _coerce_animal_track_map(animals, animal_to_track_id, mask_store)
+    if len(set(track_map.values())) < 2:
+        return animal_dfs, {"frames_checked": 0, "frames_corrected": 0}
+
+    frames = _source_frames(first_df, n_rows)
+    centers = np.stack([_animal_centers(df, n_rows) for df in animal_dfs.values()], axis=0)
+    point_series = [_animal_point_series(df, n_rows) for df in animal_dfs.values()]
+    target_tracks = np.asarray([track_map[aid] for aid in animals], dtype=np.int64)
+    store_frames = getattr(mask_store, "frames", {}) or {}
+    workers = _resolve_worker_count(max_workers, n_rows)
+    chunks = _row_chunks(n_rows, workers)
+
+    def _scan_chunk(chunk: tuple[int, int]) -> tuple[list[tuple[int, np.ndarray]], int, int]:
+        start, stop = chunk
+        hits: list[tuple[int, np.ndarray]] = []
+        checked = 0
+        exact_checked = 0
+        for row_idx in range(start, stop):
+            annotations = _mask_annotations_for_tracks(store_frames, int(frames[row_idx]), target_tracks)
+            if annotations is None:
+                continue
+            checked += 1
+            assignment, used_exact = _best_identity_assignment_from_masks(
+                point_series,
+                row_idx,
+                centers[:, row_idx, :],
+                annotations,
+                exact_masks=exact_masks,
+            )
+            if assignment is None:
+                continue
+            exact_checked += int(used_exact)
+            if not np.array_equal(assignment, np.arange(len(animals), dtype=np.int64)):
+                hits.append((row_idx, assignment))
+        return hits, checked, exact_checked
+
+    assignments: list[tuple[int, np.ndarray]] = []
+    frames_checked = 0
+    exact_frames_checked = 0
+    if workers > 1 and len(chunks) > 1:
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            for chunk_hits, chunk_checked, chunk_exact in executor.map(_scan_chunk, chunks):
+                assignments.extend(chunk_hits)
+                frames_checked += int(chunk_checked)
+                exact_frames_checked += int(chunk_exact)
+    else:
+        for chunk in chunks:
+            chunk_hits, chunk_checked, chunk_exact = _scan_chunk(chunk)
+            assignments.extend(chunk_hits)
+            frames_checked += int(chunk_checked)
+            exact_frames_checked += int(chunk_exact)
+
+    if not assignments:
+        return _copy_animal_dfs(animal_dfs), {
+            "frames_checked": int(frames_checked),
+            "frames_corrected": 0,
+            "exact_mask_frames_checked": int(exact_frames_checked),
+        }
+
+    fixed = _copy_animal_dfs(animal_dfs)
+    original = animal_dfs
+    row_source_for_target = np.tile(np.arange(len(animals), dtype=np.int64)[:, None], (1, n_rows))
+    for row_idx, current_to_target in assignments:
+        for source_idx, target_idx in enumerate(current_to_target):
+            row_source_for_target[int(target_idx), int(row_idx)] = int(source_idx)
+
+    for target_idx, target_animal in enumerate(animals):
+        target_df = fixed[target_animal]
+        for source_idx, source_animal in enumerate(animals):
+            rows = np.flatnonzero(row_source_for_target[target_idx] == source_idx)
+            if rows.size == 0 or source_idx == target_idx:
+                continue
+            cols = _shared_bodypart_columns(target_df, original[source_animal])
+            if not cols:
+                continue
+            target_locs = [target_df.columns.get_loc(col) for col in cols]
+            source_locs = [original[source_animal].columns.get_loc(col) for col in cols]
+            target_df.iloc[rows, target_locs] = original[source_animal].iloc[rows, source_locs].to_numpy()
+
+    return fixed, {
+        "frames_checked": int(frames_checked),
+        "frames_corrected": int(len({row for row, _assignment in assignments})),
+        "exact_mask_frames_checked": int(exact_frames_checked),
+    }
+
+
+def _resolve_worker_count(max_workers: Optional[int], work_items: int) -> int:
+    if work_items <= 1:
+        return 1
+    if max_workers is None:
+        count = min(work_items, max(1, (os.cpu_count() or 2) - 1))
+    else:
+        count = int(max_workers)
+    return max(1, min(int(work_items), count))
+
+
+def _row_chunks(n_rows: int, workers: int) -> list[tuple[int, int]]:
+    if n_rows <= 0:
+        return []
+    workers = max(1, int(workers))
+    chunk_size = max(512, int(np.ceil(n_rows / workers)))
+    return [(start, min(n_rows, start + chunk_size)) for start in range(0, n_rows, chunk_size)]
+
+
+def _copy_animal_dfs(animal_dfs: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
+    copied: dict[str, pd.DataFrame] = {}
+    for aid, df in animal_dfs.items():
+        out = df.copy()
+        out.attrs.update(getattr(df, "attrs", {}))
+        copied[aid] = out
+    return copied
+
+
+def _source_frames(df: pd.DataFrame, n_rows: int) -> np.ndarray:
+    frames = getattr(df, "attrs", {}).get("frame_numbers")
+    if frames is not None:
+        arr = np.asarray(frames, dtype=np.int64).reshape(-1)
+        if len(arr) >= n_rows:
+            return arr[:n_rows].copy()
+    return np.arange(n_rows, dtype=np.int64)
+
+
+def _coerce_animal_track_map(
+    animals: list[str],
+    animal_to_track_id: Optional[dict[str, int]],
+    mask_store: Any,
+) -> dict[str, int]:
+    available = _available_track_ids(mask_store)
+    ordered = sorted(available)
+    if _prefer_track_order_for_animals(animals, ordered):
+        return {
+            aid: int(ordered[idx])
+            for idx, aid in enumerate(animals)
+            if idx < len(ordered)
+        }
+
+    out: dict[str, int] = {}
+    if animal_to_track_id:
+        used: set[int] = set()
+        for aid in animals:
+            try:
+                track_id = int(animal_to_track_id[aid])
+            except Exception:
+                continue
+            if track_id in used:
+                continue
+            if available and track_id not in available:
+                continue
+            out[aid] = track_id
+            used.add(track_id)
+    missing = [aid for aid in animals if aid not in out]
+    for idx, aid in enumerate(missing):
+        parsed = _numeric_suffix(aid)
+        if parsed is not None and (not available or (parsed in available and parsed not in out.values())):
+            out[aid] = int(parsed)
+        elif parsed == 0 and 1 in available and 1 not in out.values():
+            out[aid] = 1
+        else:
+            for track_id in ordered:
+                if track_id not in out.values():
+                    out[aid] = int(track_id)
+                    break
+            if aid in out:
+                continue
+            out[aid] = len(out) + 1
+    if len(out) < len(animals) and ordered:
+        return {
+            aid: int(ordered[idx])
+            for idx, aid in enumerate(animals)
+            if idx < len(ordered)
+        }
+    return out
+
+
+def _prefer_track_order_for_animals(animals: list[str], ordered_tracks: list[int]) -> bool:
+    if len(ordered_tracks) < len(animals) or not animals:
+        return False
+    suffixes = [_numeric_suffix(aid) for aid in animals]
+    if any(value is None for value in suffixes):
+        return False
+    numeric = [int(value) for value in suffixes if value is not None]
+    if sorted(numeric) != list(range(1, len(numeric) + 1)):
+        return False
+    available = set(int(track) for track in ordered_tracks)
+    if set(numeric).issubset(available):
+        return False
+    return True
+
+
+def _available_track_ids(mask_store: Any) -> set[int]:
+    frames = getattr(mask_store, "frames", None)
+    if not isinstance(frames, dict):
+        return set()
+    ids: set[int] = set()
+    for annotations in frames.values():
+        for ann in annotations or []:
+            try:
+                ids.add(int(getattr(ann, "track_id")))
+            except Exception:
+                continue
+    return ids
+
+
+def _numeric_suffix(text: object) -> Optional[int]:
+    import re
+
+    found = re.findall(r"\d+", str(text or ""))
+    if not found:
+        return None
+    return int(found[-1])
+
+
+def _animal_centers(df: pd.DataFrame, n_rows: int) -> np.ndarray:
+    for candidates in (_CENTER_CANDIDATES, _NECK_CANDIDATES):
+        point = _first_bodypart_xy(df, candidates, n_rows)
+        if point is not None:
+            return point
+
+    nose = _first_bodypart_xy(df, _NOSE_CANDIDATES, n_rows)
+    tail = _first_bodypart_xy(df, _TAIL_CANDIDATES, n_rows)
+    if nose is not None and tail is not None:
+        return (nose + tail) / 2.0
+
+    points = []
+    for bp in get_bodyparts(df):
+        point = _bodypart_xy(df, bp, n_rows)
+        if point is not None:
+            points.append(point)
+    if not points:
+        return np.full((n_rows, 2), np.nan, dtype=np.float64)
+    stacked = np.stack(points, axis=0)
+    with np.errstate(invalid="ignore"):
+        return np.nanmean(stacked, axis=0)
+
+
+def _animal_point_series(df: pd.DataFrame, n_rows: int) -> list[tuple[np.ndarray, Optional[np.ndarray]]]:
+    series: list[tuple[np.ndarray, Optional[np.ndarray]]] = []
+    for bp in get_bodyparts(df):
+        xy = _bodypart_xy(df, bp, n_rows)
+        if xy is None:
+            continue
+        likelihood = None
+        lik_col = f"{bp}_likelihood"
+        if lik_col in df.columns:
+            likelihood = _pad_float(df[lik_col].to_numpy(dtype=np.float64), n_rows)
+        series.append((xy, likelihood))
+    return series
+
+
+def _points_for_row(
+    series: list[tuple[np.ndarray, Optional[np.ndarray]]],
+    row_idx: int,
+) -> np.ndarray:
+    points: list[np.ndarray] = []
+    for xy, likelihood in series:
+        if row_idx < 0 or row_idx >= len(xy):
+            continue
+        point = xy[row_idx]
+        if not np.isfinite(point).all():
+            continue
+        if likelihood is not None and row_idx < len(likelihood):
+            lik = float(likelihood[row_idx])
+            if np.isfinite(lik) and lik < 0.05:
+                continue
+        points.append(point.astype(np.float64, copy=False))
+    if not points:
+        return np.empty((0, 2), dtype=np.float64)
+    return np.vstack(points).astype(np.float64, copy=False)
+
+
+def _first_bodypart_xy(
+    df: pd.DataFrame,
+    candidates: list[str],
+    n_rows: int,
+) -> Optional[np.ndarray]:
+    lower = {bp.lower(): bp for bp in get_bodyparts(df)}
+    for cand in candidates:
+        bp = lower.get(str(cand).lower())
+        if bp is None:
+            continue
+        point = _bodypart_xy(df, bp, n_rows)
+        if point is not None and np.isfinite(point).any():
+            return point
+    return None
+
+
+def _bodypart_xy(df: pd.DataFrame, bp: str, n_rows: int) -> Optional[np.ndarray]:
+    x_col = f"{bp}_x"
+    y_col = f"{bp}_y"
+    if x_col not in df.columns or y_col not in df.columns:
+        return None
+    x = _pad_float(df[x_col].to_numpy(dtype=np.float64), n_rows)
+    y = _pad_float(df[y_col].to_numpy(dtype=np.float64), n_rows)
+    return np.column_stack([x, y])
+
+
+def _pad_float(values: np.ndarray, n_rows: int) -> np.ndarray:
+    arr = np.asarray(values, dtype=np.float64).reshape(-1)
+    if len(arr) >= n_rows:
+        return arr[:n_rows].copy()
+    out = np.full(n_rows, np.nan, dtype=np.float64)
+    out[: len(arr)] = arr
+    return out
+
+
+def _mask_centers_for_tracks(
+    store_frames: dict,
+    frame_idx: int,
+    target_tracks: np.ndarray,
+) -> Optional[np.ndarray]:
+    annotations = store_frames.get(int(frame_idx), []) or []
+    if not annotations:
+        return None
+    out = np.full((len(target_tracks), 2), np.nan, dtype=np.float64)
+    track_to_pos = {int(track): idx for idx, track in enumerate(target_tracks)}
+    for ann in annotations:
+        try:
+            track_id = int(getattr(ann, "track_id"))
+        except Exception:
+            continue
+        pos = track_to_pos.get(track_id)
+        if pos is None:
+            continue
+        center = _bbox_center(getattr(ann, "bbox", None))
+        if center is not None:
+            out[pos] = center
+    if np.isfinite(out).all(axis=1).sum() < 2:
+        return None
+    return out
+
+
+def _mask_annotations_for_tracks(
+    store_frames: dict,
+    frame_idx: int,
+    target_tracks: np.ndarray,
+) -> Optional[list[Any]]:
+    annotations = store_frames.get(int(frame_idx), []) or []
+    if not annotations:
+        return None
+    out: list[Any] = [None] * len(target_tracks)
+    track_to_pos = {int(track): idx for idx, track in enumerate(target_tracks)}
+    for ann in annotations:
+        try:
+            track_id = int(getattr(ann, "track_id"))
+        except Exception:
+            continue
+        pos = track_to_pos.get(track_id)
+        if pos is not None:
+            out[pos] = ann
+    if sum(ann is not None for ann in out) < 2:
+        return None
+    return out
+
+
+def _bbox_center(bbox: object) -> Optional[np.ndarray]:
+    if bbox is None:
+        return None
+    try:
+        x, y, w, h = [float(v) for v in list(bbox)[:4]]
+    except Exception:
+        return None
+    if not np.isfinite([x, y, w, h]).all() or w <= 0 or h <= 0:
+        return None
+    return np.asarray([x + w / 2.0, y + h / 2.0], dtype=np.float64)
+
+
+def _best_identity_assignment(
+    animal_centers: np.ndarray,
+    mask_centers: np.ndarray,
+) -> Optional[np.ndarray]:
+    n = int(min(len(animal_centers), len(mask_centers)))
+    if n < 2:
+        return None
+    costs = np.full((n, n), np.inf, dtype=np.float64)
+    for i in range(n):
+        if not np.isfinite(animal_centers[i]).all():
+            continue
+        for j in range(n):
+            if np.isfinite(mask_centers[j]).all():
+                costs[i, j] = float(np.linalg.norm(animal_centers[i] - mask_centers[j]))
+    if not np.isfinite(costs).any():
+        return None
+    if n > 7:
+        assignment = np.full(n, -1, dtype=np.int64)
+        used_targets: set[int] = set()
+        candidates = [
+            (float(costs[i, j]), i, j)
+            for i in range(n)
+            for j in range(n)
+            if np.isfinite(costs[i, j])
+        ]
+        for _cost, source_idx, target_idx in sorted(candidates, key=lambda item: item[0]):
+            if assignment[source_idx] >= 0 or target_idx in used_targets:
+                continue
+            assignment[source_idx] = target_idx
+            used_targets.add(target_idx)
+        if np.any(assignment < 0):
+            return None
+        return assignment
+    best_perm = None
+    best_cost = np.inf
+    for perm in itertools.permutations(range(n)):
+        c = float(sum(costs[i, perm[i]] for i in range(n)))
+        if c < best_cost:
+            best_cost = c
+            best_perm = perm
+    if best_perm is None or not np.isfinite(best_cost):
+        return None
+    return np.asarray(best_perm, dtype=np.int64)
+
+
+def _best_identity_assignment_from_masks(
+    point_series: list[list[tuple[np.ndarray, Optional[np.ndarray]]]],
+    row_idx: int,
+    animal_centers: np.ndarray,
+    annotations: list[Any],
+    *,
+    exact_masks: bool,
+) -> tuple[Optional[np.ndarray], bool]:
+    n = int(min(len(point_series), len(annotations)))
+    if n < 2:
+        return None, False
+
+    use_exact = bool(exact_masks and _annotations_have_overlapping_bboxes(annotations[:n]))
+    decoded_masks = [_decode_annotation_mask(ann) if use_exact else None for ann in annotations[:n]]
+    if use_exact and not all(mask is not None for mask in decoded_masks):
+        use_exact = False
+        decoded_masks = [None] * n
+    costs = np.full((n, n), np.inf, dtype=np.float64)
+    for source_idx in range(n):
+        points = _points_for_row(point_series[source_idx], row_idx)
+        if points.size == 0:
+            continue
+        center = _robust_points_center(points, animal_centers[source_idx])
+        for target_idx in range(n):
+            ann = annotations[target_idx]
+            if ann is None:
+                continue
+            bbox = getattr(ann, "bbox", None)
+            costs[source_idx, target_idx] = _mask_identity_cost(
+                points,
+                center,
+                bbox,
+                decoded_masks[target_idx],
+            )
+    assignment = _best_assignment_from_costs(costs)
+    return assignment, bool(use_exact and any(mask is not None for mask in decoded_masks))
+
+
+def _best_assignment_from_costs(costs: np.ndarray) -> Optional[np.ndarray]:
+    n = int(min(costs.shape)) if costs.ndim == 2 else 0
+    if n < 2 or not np.isfinite(costs).any():
+        return None
+    if n > 7:
+        assignment = np.full(n, -1, dtype=np.int64)
+        used_targets: set[int] = set()
+        candidates = [
+            (float(costs[i, j]), i, j)
+            for i in range(n)
+            for j in range(n)
+            if np.isfinite(costs[i, j])
+        ]
+        for _cost, source_idx, target_idx in sorted(candidates, key=lambda item: item[0]):
+            if assignment[source_idx] >= 0 or target_idx in used_targets:
+                continue
+            assignment[source_idx] = target_idx
+            used_targets.add(target_idx)
+        if np.any(assignment < 0):
+            return None
+        return assignment
+
+    best_perm = None
+    best_cost = np.inf
+    for perm in itertools.permutations(range(n)):
+        cost = float(sum(costs[i, perm[i]] for i in range(n)))
+        if cost < best_cost:
+            best_cost = cost
+            best_perm = perm
+    if best_perm is None or not np.isfinite(best_cost):
+        return None
+    return np.asarray(best_perm, dtype=np.int64)
+
+
+def _mask_identity_cost(
+    points: np.ndarray,
+    center: np.ndarray,
+    bbox: object,
+    mask: Optional[np.ndarray],
+) -> float:
+    bbox_values = _bbox_values(bbox)
+    if bbox_values is None:
+        return np.inf
+    x, y, w, h = bbox_values
+    bbox_center = np.asarray([x + w / 2.0, y + h / 2.0], dtype=np.float64)
+    diag = max(float(np.hypot(w, h)), 1.0)
+    center_dist = float(np.linalg.norm(center - bbox_center)) if np.isfinite(center).all() else diag
+    bbox_hits = _count_points_in_bbox(points, bbox_values, margin=2.0)
+    bbox_fraction = float(bbox_hits / max(len(points), 1))
+
+    if mask is not None:
+        mask_hits = _count_points_in_mask(points, mask, radius=2)
+        mask_fraction = float(mask_hits / max(len(points), 1))
+        return (
+            center_dist / diag
+            - 1000.0 * float(mask_hits)
+            - 250.0 * mask_fraction
+            - 5.0 * float(bbox_hits)
+            - 2.0 * bbox_fraction
+        )
+
+    return (
+        center_dist / diag
+        - 50.0 * float(bbox_hits)
+        - 20.0 * bbox_fraction
+    )
+
+
+def _bbox_values(bbox: object) -> Optional[tuple[float, float, float, float]]:
+    if bbox is None:
+        return None
+    try:
+        x, y, w, h = [float(v) for v in list(bbox)[:4]]
+    except Exception:
+        return None
+    if not np.isfinite([x, y, w, h]).all() or w <= 0 or h <= 0:
+        return None
+    return x, y, w, h
+
+
+def _robust_points_center(points: np.ndarray, fallback: np.ndarray) -> np.ndarray:
+    if points.size:
+        with np.errstate(invalid="ignore"):
+            center = np.nanmedian(points, axis=0)
+        if np.isfinite(center).all():
+            return np.asarray(center, dtype=np.float64)
+    return np.asarray(fallback, dtype=np.float64)
+
+
+def _count_points_in_bbox(
+    points: np.ndarray,
+    bbox: tuple[float, float, float, float],
+    *,
+    margin: float = 0.0,
+) -> int:
+    if points.size == 0:
+        return 0
+    x, y, w, h = bbox
+    finite = np.isfinite(points).all(axis=1)
+    inside = (
+        finite
+        & (points[:, 0] >= x - margin)
+        & (points[:, 0] <= x + w + margin)
+        & (points[:, 1] >= y - margin)
+        & (points[:, 1] <= y + h + margin)
+    )
+    return int(np.count_nonzero(inside))
+
+
+def _count_points_in_mask(points: np.ndarray, mask: np.ndarray, *, radius: int = 0) -> int:
+    if points.size == 0 or mask is None:
+        return 0
+    mask_arr = np.asarray(mask, dtype=bool)
+    if mask_arr.ndim != 2 or not mask_arr.any():
+        return 0
+    h, w = mask_arr.shape
+    hits = 0
+    r = max(0, int(radius))
+    for x_raw, y_raw in points:
+        if not np.isfinite([x_raw, y_raw]).all():
+            continue
+        x = int(round(float(x_raw)))
+        y = int(round(float(y_raw)))
+        if x < 0 or y < 0 or x >= w or y >= h:
+            continue
+        if r <= 0:
+            hits += int(bool(mask_arr[y, x]))
+            continue
+        x0 = max(0, x - r)
+        x1 = min(w, x + r + 1)
+        y0 = max(0, y - r)
+        y1 = min(h, y + r + 1)
+        hits += int(bool(mask_arr[y0:y1, x0:x1].any()))
+    return int(hits)
+
+
+def _annotations_have_overlapping_bboxes(annotations: list[Any]) -> bool:
+    bboxes = [_bbox_values(getattr(ann, "bbox", None)) for ann in annotations if ann is not None]
+    for idx, bbox_a in enumerate(bboxes):
+        if bbox_a is None:
+            continue
+        for bbox_b in bboxes[idx + 1:]:
+            if bbox_b is None:
+                continue
+            if _bbox_intersection_area(bbox_a, bbox_b) > 0.0:
+                return True
+    return False
+
+
+def _bbox_intersection_area(
+    bbox_a: tuple[float, float, float, float],
+    bbox_b: tuple[float, float, float, float],
+) -> float:
+    ax, ay, aw, ah = bbox_a
+    bx, by, bw, bh = bbox_b
+    ix0 = max(ax, bx)
+    iy0 = max(ay, by)
+    ix1 = min(ax + aw, bx + bw)
+    iy1 = min(ay + ah, by + bh)
+    if ix1 <= ix0 or iy1 <= iy0:
+        return 0.0
+    return float((ix1 - ix0) * (iy1 - iy0))
+
+
+def _decode_annotation_mask(annotation: Any) -> Optional[np.ndarray]:
+    if annotation is None:
+        return None
+    segmentation = getattr(annotation, "segmentation", None)
+    size = getattr(annotation, "size", None)
+    if segmentation is None or size is None:
+        return None
+    try:
+        from dlc_processor.core.mask_loader import decode_coco_segmentation
+
+        return decode_coco_segmentation(segmentation, size)
+    except Exception:
+        logger.debug("Could not decode mask annotation during identity repair", exc_info=True)
+        return None
+
+
+def _shared_bodypart_columns(target_df: pd.DataFrame, source_df: pd.DataFrame) -> list[str]:
+    target_bps = get_bodyparts(target_df)
+    source_bps = set(get_bodyparts(source_df))
+    cols: list[str] = []
+    for bp in target_bps:
+        if bp not in source_bps:
+            continue
+        for suffix in ("_x", "_y", "_likelihood"):
+            col = f"{bp}{suffix}"
+            if col in target_df.columns and col in source_df.columns:
+                cols.append(col)
+    return cols
 
 
 # ── Stage 0: calibration ─────────────────────────────────────────────────────
@@ -347,10 +1039,21 @@ def save_cleaned_h5(
     animal_dfs: dict[str, pd.DataFrame],
     output_path: str,
     scorer: str = "DLCProcessor",
-) -> None:
-    """Save cleaned DataFrames back as DLC-compatible H5 (MultiIndex columns)."""
+) -> str:
+    """Save cleaned DataFrames as DLC-compatible H5.
+
+    Returns the actual written path. If PyTables is unavailable, falls back to
+    DLC-compatible CSV next to the requested H5 path so project persistence
+    still works in lightweight environments.
+    """
     frames = []
     for animal_id, df in animal_dfs.items():
+        frame_numbers = getattr(df, "attrs", {}).get("frame_numbers")
+        index = (
+            pd.Index(np.asarray(frame_numbers, dtype=np.int64), name="frame")
+            if frame_numbers is not None and len(frame_numbers) == len(df)
+            else pd.RangeIndex(len(df), name="frame")
+        )
         bps = get_bodyparts(df)
         for bp in bps:
             for coord in ("x", "y", "likelihood"):
@@ -363,10 +1066,56 @@ def save_cleaned_h5(
                     [(scorer, animal_id, bp, coord)],
                     names=["scorer", "individuals", "bodyparts", "coords"],
                 )
-                frames.append(pd.DataFrame(vals, columns=mi))
+                frames.append(pd.DataFrame(vals, index=index, columns=mi))
     combined = pd.concat(frames, axis=1)
-    combined.to_hdf(output_path, key="df_with_missing", mode="w")
-    logger.info("Saved cleaned H5 -> %s (%d animals)", output_path, len(animal_dfs))
+    try:
+        combined.to_hdf(output_path, key="df_with_missing", mode="w")
+        logger.info("Saved cleaned H5 -> %s (%d animals)", output_path, len(animal_dfs))
+        return str(output_path)
+    except ImportError as exc:
+        fallback_path = str(Path(output_path).with_suffix(".csv"))
+        combined.to_csv(fallback_path, index=True)
+        logger.warning(
+            "PyTables unavailable; saved cleaned tracking as CSV fallback -> %s (%d animals): %s",
+            fallback_path,
+            len(animal_dfs),
+            exc,
+        )
+        return fallback_path
+
+
+def save_cleaned_csv(
+    animal_dfs: dict[str, pd.DataFrame],
+    output_path: str,
+    scorer: str = "DLCProcessor",
+) -> str:
+    """Save cleaned DataFrames back as DLC-compatible CSV with MultiIndex columns."""
+    frames = []
+    for animal_id, df in animal_dfs.items():
+        frame_numbers = getattr(df, "attrs", {}).get("frame_numbers")
+        index = (
+            pd.Index(np.asarray(frame_numbers, dtype=np.int64), name="frame")
+            if frame_numbers is not None and len(frame_numbers) == len(df)
+            else pd.RangeIndex(len(df), name="frame")
+        )
+        bps = get_bodyparts(df)
+        for bp in bps:
+            for coord in ("x", "y", "likelihood"):
+                col_name = f"{bp}_{coord}"
+                vals = (
+                    df[col_name].to_numpy(dtype=np.float64)
+                    if col_name in df.columns
+                    else np.full(len(df), np.nan)
+                )
+                mi = pd.MultiIndex.from_tuples(
+                    [(scorer, animal_id, bp, coord)],
+                    names=["scorer", "individuals", "bodyparts", "coords"],
+                )
+                frames.append(pd.DataFrame(vals, index=index, columns=mi))
+    combined = pd.concat(frames, axis=1)
+    combined.to_csv(output_path, index=True)
+    logger.info("Saved cleaned CSV -> %s (%d animals)", output_path, len(animal_dfs))
+    return str(output_path)
 
 
 def _smooth_with_nans(arr: np.ndarray, window: int, polyorder: int) -> np.ndarray:

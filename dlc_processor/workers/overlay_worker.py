@@ -35,32 +35,66 @@ _ANIMAL_COLORS_BGR = [
     (80, 200, 200),    # yellow-green
 ]
 
+# Subtitle pill colours (BGR) — matches Gantt palette order
+_SUBTITLE_COLORS_BGR = [
+    (168, 139, 243),   # pink-red
+    (250, 180, 137),   # blue
+    (161, 227, 166),   # green
+    (135, 179, 250),   # peach/orange
+    (247, 166, 203),   # mauve
+    (175, 226, 249),   # yellow
+    (213, 226, 148),   # teal
+    (231, 194, 245),   # pink
+    (236, 199, 116),   # sapphire
+]
+
 # Keypoint circle radius
 _KP_RADIUS = 5
 _KP_THICKNESS = -1
 
-# Skeleton connections — default 7-bodypart mouse layout
+# Skeleton connections — default mouse layout.
+# resolve_skeleton_edges() filters out edges whose bodyparts are absent,
+# so this list intentionally includes optional bodyparts (fhip, body_center).
+# Duplicate / self edges are stripped automatically during resolution.
 _SKELETON_EDGES = [
+    # Head
     ("nose", "left_ear"),
     ("nose", "right_ear"),
     ("left_ear", "neck"),
     ("right_ear", "neck"),
+    # Forebody (fhip = forehip / shoulder — optional)
+    ("neck", "left_fhip"),
+    ("neck", "right_fhip"),
+    # Centre spine
+    ("neck", "body_center"),
+    ("body_center", "left_hip"),
+    ("body_center", "right_hip"),
+    # Fallback: direct neck-to-hip when no body_center/fhip
     ("neck", "left_hip"),
     ("neck", "right_hip"),
+    # Forehip to hip
+    ("left_fhip", "left_hip"),
+    ("right_fhip", "right_hip"),
+    # Hindquarters
     ("left_hip", "tail"),
     ("right_hip", "tail"),
 ]
 
-# Common name aliases — maps canonical names to alternatives
+# Common name aliases — maps canonical names to alternatives found in DLC configs.
 _BP_ALIASES: dict[str, list[str]] = {
-    "nose": ["Nose", "snout", "Snout"],
-    "left_ear": ["Left_ear", "left_Ear", "ear_left", "Ear_left", "lear"],
-    "right_ear": ["Right_ear", "right_Ear", "ear_right", "Ear_right", "rear"],
-    "neck": ["Neck", "spine1", "Spine_1", "spine_1", "nape"],
-    "left_hip": ["Left_hip", "left_Hip", "hip_left", "Hip_left", "lhip"],
-    "right_hip": ["Right_hip", "right_Hip", "hip_right", "Hip_right", "rhip"],
-    "tail": ["Tail", "tailbase", "Tailbase", "tail_base", "Tail_base", "tail_tip"],
-    "body_centre": ["body_center", "center", "Center", "Centre", "centroid", "spine2", "Spine_2"],
+    "nose": ["Nose", "snout", "Snout", "nose_tip", "Nose_tip"],
+    "left_ear": ["Left_ear", "left_Ear", "ear_left", "Ear_left", "lear", "leftear", "l_ear"],
+    "right_ear": ["Right_ear", "right_Ear", "ear_right", "Ear_right", "rear", "rightear", "r_ear"],
+    "neck": ["Neck", "spine1", "Spine_1", "spine_1", "nape", "Nape"],
+    "left_fhip": ["Left_fhip", "left_forehip", "lfhip", "left_shoulder", "Left_shoulder"],
+    "right_fhip": ["Right_fhip", "right_forehip", "rfhip", "right_shoulder", "Right_shoulder"],
+    "left_hip": ["Left_hip", "left_Hip", "hip_left", "Hip_left", "lhip", "lefthip"],
+    "right_hip": ["Right_hip", "right_Hip", "hip_right", "Hip_right", "rhip", "righthip"],
+    "tail": ["Tail", "tailbase", "Tailbase", "tail_base", "Tail_base", "tail_tip", "tailtip"],
+    "body_center": [
+        "body_centre", "center", "Center", "Centre", "centroid",
+        "spine2", "Spine_2", "spine_2", "mid_body", "midbody", "body_centre",
+    ],
 }
 
 
@@ -103,11 +137,15 @@ def resolve_skeleton_edges(
         return None
 
     resolved = []
+    seen: set[tuple[str, str]] = set()
     for bp1, bp2 in edges:
         r1 = _resolve(bp1)
         r2 = _resolve(bp2)
-        if r1 is not None and r2 is not None:
-            resolved.append((r1, r2))
+        if r1 is not None and r2 is not None and r1 != r2:
+            key = (min(r1, r2), max(r1, r2))  # order-independent
+            if key not in seen:
+                seen.add(key)
+                resolved.append((r1, r2))
     return resolved
 
 
@@ -139,6 +177,7 @@ class OverlayWorker(QThread):
         self.draw_behaviors  = draw_behaviors
         self.skeleton_edges  = skeleton_edges
         self.fill_body       = False
+        self.frame_index_mode = "video"
         self._abort          = False
         self._seek_frame: Optional[int] = None    # for single-frame seek
 
@@ -204,10 +243,11 @@ class OverlayWorker(QThread):
 
         for ai, animal_id in enumerate(animals):
             df = self.animal_dfs[animal_id]
-            if fi >= len(df):
+            row_idx = _resolve_data_row(df, fi, getattr(self, "frame_index_mode", "video"))
+            if row_idx is None:
                 continue
             color = _ANIMAL_COLORS_BGR[ai % len(_ANIMAL_COLORS_BGR)]
-            row   = df.iloc[fi]
+            row   = df.iloc[row_idx]
             bps   = get_bodyparts(df)
 
             kp_coords: dict[str, tuple[int, int]] = {}
@@ -259,22 +299,60 @@ class OverlayWorker(QThread):
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2, cv2.LINE_AA,
                 )
 
-        # Behaviour subtitle banner (boolean behaviours only, skip continuous)
+        # Behaviour subtitle pills — each active behaviour gets a colored badge
         draw_behaviors = getattr(self, "draw_behaviors", True)
         if draw_behaviors:
-            active_behaviors = [
-                _pretty_behavior_name(name) for name, arr in self.behavior_arrays.items()
-                if arr.dtype == bool and fi < len(arr) and arr[fi]
-            ]
-            if active_behaviors:
-                banner_h = 32
-                banner   = np.zeros((banner_h, fw, 3), dtype=np.uint8)
-                text     = "  |  ".join(active_behaviors)
-                cv2.putText(
-                    banner, text, (8, 22),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (240, 240, 240), 1, cv2.LINE_AA,
+            behavior_idx = fi
+            if animals and animals[0] in self.animal_dfs:
+                resolved_idx = _resolve_data_row(
+                    self.animal_dfs[animals[0]],
+                    fi,
+                    getattr(self, "frame_index_mode", "video"),
                 )
-                out[-banner_h:] = cv2.addWeighted(out[-banner_h:], 0.35, banner, 0.65, 0)
+                if resolved_idx is None:
+                    behavior_idx = -1
+                else:
+                    behavior_idx = resolved_idx
+            all_bool_names = [
+                name for name, arr in self.behavior_arrays.items()
+                if arr.dtype == bool
+            ]
+            active = [
+                (name, all_bool_names.index(name))
+                for name in all_bool_names
+                if 0 <= behavior_idx < len(self.behavior_arrays[name])
+                and self.behavior_arrays[name][behavior_idx]
+            ]
+            if active:
+                pill_h = 34
+                pad_y = 6
+                font_scale = 0.7
+                thickness = 2
+                margin_x = fw // 2   # centre pills horizontally
+                y_bottom = fh - 10
+
+                for name, color_idx in reversed(active):
+                    label = _pretty_behavior_name(name)
+                    bgr = _SUBTITLE_COLORS_BGR[color_idx % len(_SUBTITLE_COLORS_BGR)]
+                    (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
+                    pill_w = tw + 20
+                    x1 = margin_x - pill_w // 2
+                    y1 = y_bottom - pill_h
+                    x2 = x1 + pill_w
+                    y2 = y_bottom
+
+                    # Semi-transparent filled rectangle
+                    overlay = out.copy()
+                    cv2.rectangle(overlay, (x1, y1), (x2, y2), bgr, -1)
+                    cv2.addWeighted(overlay, 0.75, out, 0.25, 0, out)
+
+                    # White text centred in pill
+                    tx = x1 + (pill_w - tw) // 2
+                    ty = y2 - (pill_h - th) // 2
+                    cv2.putText(out, label, (tx, ty),
+                                cv2.FONT_HERSHEY_SIMPLEX, font_scale,
+                                (255, 255, 255), thickness, cv2.LINE_AA)
+                    y_bottom = y1 - pad_y
 
         return out
 
@@ -287,22 +365,69 @@ def _to_qimage(frame_bgr: np.ndarray) -> QImage:
     return img.copy()   # copy so the numpy buffer can be freed safely
 
 
+def _resolve_data_row(df, frame_idx: int, mode: str) -> Optional[int]:
+    if mode == "row":
+        row_idx = int(frame_idx)
+        return row_idx if 0 <= row_idx < len(df) else None
+
+    frames = getattr(df, "attrs", {}).get("frame_numbers")
+    if frames is None:
+        row_idx = int(frame_idx)
+        return row_idx if 0 <= row_idx < len(df) else None
+
+    arr = np.asarray(frames, dtype=np.int64).reshape(-1)
+    if len(arr) != len(df) or len(arr) == 0:
+        row_idx = int(frame_idx)
+        return row_idx if 0 <= row_idx < len(df) else None
+
+    target = int(frame_idx)
+    if len(arr) > 1 and np.all(np.diff(arr) == 1):
+        row_idx = target - int(arr[0])
+        return row_idx if 0 <= row_idx < len(arr) else None
+
+    pos = int(np.searchsorted(arr, target))
+    if 0 <= pos < len(arr) and int(arr[pos]) == target:
+        return pos
+    return None
+
+
 def _pretty_behavior_name(name: str) -> str:
+    if "__" in name:
+        animal, metric = name.split("__", 1)
+        if metric in {"immobile", "is_immobile"}:
+            return f"{animal} immobile"
+        if metric in {"mobile", "is_mobile"}:
+            return f"{animal} mobile"
     pretty = {
-        "nose2nose": "nose\u2194nose",
+        "nose2nose": "nose-to-nose",
+        "mask_contact": "mask contact",
+        "fighting": "fighting",
+        "attacks": "attacks",
         "sidebyside": "side-by-side",
-        "sidereside": "side\u2194rear",
-        "a_nose2anogenital_b": "A\u2192B anogenital",
-        "b_nose2anogenital_a": "B\u2192A anogenital",
-        "a_nose2body_b": "A\u2192B body",
-        "b_nose2body_a": "B\u2192A body",
+        "sidereside": "side-reverse",
+        "a_nose2anogenital_b": "A to B anogenital",
+        "b_nose2anogenital_a": "B to A anogenital",
+        "a_nose2body_b": "A to B body",
+        "b_nose2body_a": "B to A body",
         "a_following_b": "A follows B",
         "b_following_a": "B follows A",
-        "a_oriented_toward_b": "A oriented\u2192B",
-        "b_oriented_toward_a": "B oriented\u2192A",
+        "a_chasing_b": "A chases B",
+        "b_chasing_a": "B chases A",
+        "a_approaches_b": "A approaches B",
+        "b_approaches_a": "B approaches A",
+        "a_withdraws_from_b": "A withdraws from B",
+        "b_withdraws_from_a": "B withdraws from A",
+        "a_escapes_b": "A escapes B",
+        "b_escapes_a": "B escapes A",
+        "a_withdrawal_after_contact_b": "A withdraws after contact B",
+        "b_withdrawal_after_contact_a": "B withdraws after contact A",
+        "a_oriented_toward_b": "A oriented to B",
+        "b_oriented_toward_a": "B oriented to A",
         "passive_anogenital": "passive anogenital",
         "passive_investigation": "passive investigation",
         "passive_being_followed": "passive followed",
+        "passive_being_chased": "passive chased",
+        "passive_withdrawal": "passive withdrawal",
         "rearing": "rearing",
     }
     return pretty.get(name, name.replace("_", " "))

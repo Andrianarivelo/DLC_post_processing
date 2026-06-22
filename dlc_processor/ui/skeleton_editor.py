@@ -10,7 +10,7 @@ from __future__ import annotations
 import math
 from typing import Optional
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import (
     QBrush,
     QColor,
@@ -118,6 +118,8 @@ class _EdgeLine(QGraphicsLineItem):
 class SkeletonEditorDialog(QDialog):
     """Modal dialog for interactively editing skeleton connections."""
 
+    save_default_requested = Signal(list)  # emits list of edge tuples
+
     def __init__(
         self,
         bodyparts: list[str],
@@ -169,7 +171,7 @@ class SkeletonEditorDialog(QDialog):
 
         # Centre — canvas
         centre = QVBoxLayout()
-        centre.addWidget(_section_label("Canvas  (click two nodes to connect)"))
+        centre.addWidget(_section_label("Click two nodes to connect  |  Right-click an edge to remove"))
         self._scene = QGraphicsScene(self)
         self._scene.setBackgroundBrush(QBrush(QColor("#11111b")))
         self._view = QGraphicsView(self._scene)
@@ -193,6 +195,13 @@ class SkeletonEditorDialog(QDialog):
         btn_clear.clicked.connect(self._clear_all_edges)
         right.addWidget(btn_clear)
 
+        right.addSpacing(8)
+
+        btn_save_default = QPushButton("Save as Default")
+        btn_save_default.setToolTip("Save current skeleton as the default for future sessions")
+        btn_save_default.clicked.connect(self._save_as_default)
+        right.addWidget(btn_save_default)
+
         right.addSpacing(12)
 
         # OK / Cancel
@@ -208,20 +217,61 @@ class SkeletonEditorDialog(QDialog):
         root.addLayout(right)
 
     def _place_nodes(self) -> None:
-        """Arrange bodypart nodes in a circle on the canvas."""
+        """Arrange bodypart nodes anatomically (mouse dorsal view) when possible.
+
+        Recognised bodyparts are placed at fixed anatomical positions.
+        Unrecognised bodyparts are arranged in a row below the skeleton.
+        """
         n = len(self._bodyparts)
         if n == 0:
             return
-        cx, cy = 180.0, 180.0
-        radius = 140.0
 
-        for i, bp in enumerate(self._bodyparts):
-            angle = 2 * math.pi * i / n - math.pi / 2
-            x = cx + radius * math.cos(angle)
-            y = cy + radius * math.sin(angle)
-            node = _BodypartNode(bp, x, y, self)
-            self._scene.addItem(node)
-            self._nodes[bp] = node
+        # Anatomical positions (dorsal mouse view, nose at top)
+        # Canvas coordinates: x ∈ [40, 320], y ∈ [20, 360]
+        _ANAT_POS: dict[str, tuple[float, float]] = {
+            "nose":         (180, 20),
+            "left_ear":     (110, 70),
+            "right_ear":    (250, 70),
+            "neck":         (180, 110),
+            "left_fhip":    (100, 160),
+            "right_fhip":   (260, 160),
+            "body_center":  (180, 200),
+            "left_hip":     (110, 260),
+            "right_hip":    (250, 260),
+            "tail":         (180, 330),
+        }
+
+        # Import alias table so we can match variant names
+        from dlc_processor.workers.overlay_worker import _BP_ALIASES
+
+        # Build reverse lookup: any alias or canonical name → canonical name
+        _alias_to_canonical: dict[str, str] = {}
+        for canonical, aliases in _BP_ALIASES.items():
+            _alias_to_canonical[canonical.lower()] = canonical
+            for a in aliases:
+                _alias_to_canonical[a.lower()] = canonical
+
+        placed = set()
+        for bp in self._bodyparts:
+            canonical = _alias_to_canonical.get(bp.lower())
+            if canonical and canonical in _ANAT_POS:
+                x, y = _ANAT_POS[canonical]
+                node = _BodypartNode(bp, x, y, self)
+                self._scene.addItem(node)
+                self._nodes[bp] = node
+                placed.add(bp)
+
+        # Place remaining (unrecognised) bodyparts in a row below the skeleton
+        unplaced = [bp for bp in self._bodyparts if bp not in placed]
+        if unplaced:
+            start_y = 380.0
+            spacing = min(80.0, 340.0 / max(len(unplaced), 1))
+            start_x = 180.0 - (len(unplaced) - 1) * spacing / 2
+            for i, bp in enumerate(unplaced):
+                x = start_x + i * spacing
+                node = _BodypartNode(bp, x, start_y, self)
+                self._scene.addItem(node)
+                self._nodes[bp] = node
 
     # ── Node click logic ──────────────────────────────────────────────────────
 
@@ -292,6 +342,16 @@ class SkeletonEditorDialog(QDialog):
         self._conn_list.clear()
         for bp1, bp2 in self._edges:
             self._conn_list.addItem(f"{bp1}  -  {bp2}")
+
+    # ── Save default ─────────────────────────────────────────────────────────
+
+    def _save_as_default(self) -> None:
+        """Persist current edges as the default skeleton in user settings."""
+        from dlc_processor.core.settings_store import load_settings, save_settings
+        settings = load_settings()
+        settings["skeleton_edges"] = [list(e) for e in self._edges]
+        save_settings(settings)
+        self.save_default_requested.emit(list(self._edges))
 
     # ── Public result ─────────────────────────────────────────────────────────
 

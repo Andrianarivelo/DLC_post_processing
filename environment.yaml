@@ -1,0 +1,34 @@
+# DLC Post-Processing — conda environment
+#
+#   conda env create -f environment.yaml
+#   conda activate dlc-postproc
+#   python app.py
+#
+# This installs everything needed to launch the studio and load CSV/H5 DLC
+# tracking. DeepLabCut itself is intentionally NOT pinned here: it is heavy and
+# best kept in its own environment. The app can call that environment for
+# inference, or you can simply post-process the .h5 / .csv it already produced.
+
+name: dlc-postproc
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  # ── Core GUI ──
+  - pyside6>=6.5
+  - pyqtgraph>=0.13
+  # ── Numerics / data ──
+  - numpy>=1.23,<2
+  - pandas>=1.5
+  - scipy>=1.10
+  # ── Plotting (batch summary figures, position maps, heatmaps) ──
+  - matplotlib>=3.6
+  # ── Video I/O ──
+  - py-opencv>=4.7
+  # ── HDF5 (DLC .h5 + GLM-ready tables) ──
+  - pytables>=3.8
+  - h5py>=3.8
+  # ── Config files ──
+  - pyyaml>=6.0
+  # ── Optional: test suite ──
+  - pytest>=7.0

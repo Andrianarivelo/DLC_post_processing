@@ -71,9 +71,10 @@ def export_yolo(
     fw = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     fh = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
+    frame_numbers = _frame_numbers_from_dfs(animal_dfs)
     if frame_indices is None:
-        # Export every frame that has at least one valid keypoint
-        frame_indices = list(range(total_frames))
+        # Export every tracked row; map it back to source-video frame numbers.
+        frame_indices = list(range(len(frame_numbers))) if frame_numbers is not None else list(range(total_frames))
 
     # Shuffle and split
     indices = list(frame_indices)
@@ -84,9 +85,12 @@ def export_yolo(
     n_train = n_val_written = 0
 
     for fi in sorted(indices):
-        if fi < 0 or fi >= total_frames:
+        if fi < 0:
             continue
-        cap.set(cv2.CAP_PROP_POS_FRAMES, fi)
+        source_frame = int(frame_numbers[fi]) if frame_numbers is not None and fi < len(frame_numbers) else int(fi)
+        if source_frame >= total_frames:
+            continue
+        cap.set(cv2.CAP_PROP_POS_FRAMES, source_frame)
         ret, frame = cap.read()
         if not ret:
             continue
@@ -106,7 +110,7 @@ def export_yolo(
             continue
 
         split = "val" if fi in val_set else "train"
-        stem  = f"frame_{fi:07d}"
+        stem  = f"frame_{source_frame:07d}"
         img_path = out_dir / "images" / split / f"{stem}.jpg"
         lbl_path = out_dir / "labels" / split / f"{stem}.txt"
 
@@ -141,6 +145,21 @@ def export_yolo(
         "output_dir": str(out_dir),
         "yaml_path": str(yaml_path),
     }
+
+
+def _frame_numbers_from_dfs(animal_dfs: dict[str, pd.DataFrame]) -> Optional[np.ndarray]:
+    if not animal_dfs:
+        return None
+    first_df = next(iter(animal_dfs.values()), None)
+    if first_df is None:
+        return None
+    frames = getattr(first_df, "attrs", {}).get("frame_numbers")
+    if frames is None:
+        return None
+    arr = np.asarray(frames, dtype=np.int64).reshape(-1)
+    if len(arr) != len(first_df):
+        return None
+    return arr
 
 
 def _compute_bbox(

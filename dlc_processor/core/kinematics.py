@@ -14,7 +14,7 @@ Global columns:
   body_orientation_deg    — angle of nose→tailbase vector in degrees (-180..180)
   body_angle_rate_deg_fr  — angular speed in deg/frame
   distance_traveled_px    — cumulative distance from frame 0
-  freezing                — boolean, True when speed < threshold for N frames
+  immobile                — boolean, True when speed < threshold for N frames
   mobility_state          — "mobile" or "immobile" categorical label
   is_immobile             — boolean, True when immobile
   path_tortuosity         — rolling net-displacement / total-distance ratio
@@ -37,7 +37,10 @@ from dlc_processor.core.dlc_loader import get_bodyparts
 logger = logging.getLogger(__name__)
 
 # Preferred fallback chain for body centre
-_CENTRE_CANDIDATES = ["center", "Centre", "body_centre", "neck", "Neck", "spine2", "Spine_2", "mid"]
+_CENTRE_CANDIDATES = [
+    "center", "Centre", "body_center", "body_centre", "centroid", "centre",
+    "neck", "Neck", "spine", "spine1", "spine2", "Spine_2", "Spine2", "mid",
+]
 # Preferred nose / tailbase names
 _NOSE_CANDIDATES     = ["nose", "Nose"]
 _TAILBASE_CANDIDATES = ["tailbase", "Tailbase", "tail_base", "TailBase", "tail", "Tail"]
@@ -48,6 +51,7 @@ _TAILBASE_CANDIDATES = ["tailbase", "Tailbase", "tail_base", "TailBase", "tail",
 def compute_kinematics(
     df: pd.DataFrame,
     fps: float = 25.0,
+    time_s: Optional[np.ndarray] = None,
     per_bodypart: bool = True,
     body_speed: bool = True,
     orientation: bool = True,
@@ -66,6 +70,8 @@ def compute_kinematics(
     immobility_min_frames: int = 10,
     rearing_elongation_factor: float = 1.6,
     rearing_min_frames: int = 5,
+    immobile: Optional[bool] = None,
+    px_per_cm: float = 0.0,
 ) -> pd.DataFrame:
     """Add kinematic columns to a per-animal DataFrame.
 
@@ -78,16 +84,18 @@ def compute_kinematics(
     orientation      : compute body orientation angle
     acceleration     : compute body-centre acceleration and jerk
     distance_traveled: compute cumulative distance from frame 0
-    freezing         : detect freezing episodes (speed < threshold)
+    freezing         : deprecated alias for immobile detection
     mobility_state   : classify each frame as "mobile" or "immobile"
     path_tortuosity  : compute rolling tortuosity index
     body_elongation  : compute nose-to-tailbase distance
     curvature        : compute Menger curvature of trajectory
     head_direction   : compute movement heading and heading-body angle diff
-    freeze_threshold : speed threshold in px/s for freezing detection
-    freeze_min_frames: minimum consecutive frames below threshold to count as freezing
+    freeze_threshold : speed threshold in px/s for immobile detection
+    freeze_min_frames: minimum consecutive frames below threshold to count as immobile
     immobility_threshold : speed threshold in px/s for immobility detection
     immobility_min_frames: minimum consecutive frames below threshold to count as immobile
+    immobile         : preferred flag for immobile detection
+    px_per_cm        : if > 0, append calibrated cm-based metric columns
 
     Returns
     -------
@@ -95,13 +103,15 @@ def compute_kinematics(
     """
     out = df.copy()
     bodyparts = get_bodyparts(out)
+    detect_immobile = freezing if immobile is None else immobile
+    dt = _frame_dt(len(out), fps, time_s)
 
     if per_bodypart:
         for bp in bodyparts:
-            _add_speed_accel(out, bp, fps)
+            _add_speed_accel(out, bp, fps, dt)
 
     # ── Compute body centre once for all metrics that need it ──────────
-    needs_centre = body_speed or acceleration or distance_traveled or freezing or mobility_state or path_tortuosity or curvature or head_direction
+    needs_centre = body_speed or acceleration or distance_traveled or detect_immobile or mobility_state or path_tortuosity or curvature or head_direction
     cx, cy = None, None
     if needs_centre:
         cx, cy = _get_body_centre(out, bodyparts)
@@ -110,10 +120,10 @@ def compute_kinematics(
             needs_centre = False
 
     if needs_centre and body_speed:
-        _add_body_speed_from_centre(out, cx, cy, fps)
+        _add_body_speed_from_centre(out, cx, cy, fps, dt)
 
     if needs_centre and acceleration:
-        _add_body_acceleration(out, cx, cy, fps)
+        _add_body_acceleration(out, cx, cy, fps, dt)
 
     # Orientation is needed both by its own flag and by head_direction
     needs_orientation = orientation or head_direction
@@ -123,11 +133,11 @@ def compute_kinematics(
     if needs_centre and distance_traveled:
         _add_distance_traveled(out, cx, cy)
 
-    if needs_centre and freezing:
-        _add_freezing(out, cx, cy, fps, freeze_threshold, freeze_min_frames)
+    if needs_centre and detect_immobile:
+        _add_immobility(out, cx, cy, fps, freeze_threshold, freeze_min_frames, dt)
 
     if needs_centre and mobility_state:
-        _add_mobility_state(out, cx, cy, fps, immobility_threshold, immobility_min_frames)
+        _add_mobility_state(out, cx, cy, fps, immobility_threshold, immobility_min_frames, dt)
 
     if needs_centre and path_tortuosity:
         _add_path_tortuosity(out, cx, cy, window=30)
@@ -143,7 +153,10 @@ def compute_kinematics(
 
     if rearing:
         _add_rearing(out, bodyparts, fps, cx, cy,
-                     rearing_elongation_factor, rearing_min_frames)
+                     rearing_elongation_factor, rearing_min_frames, dt)
+
+    if px_per_cm > 0:
+        _append_calibrated_metric_columns(out, px_per_cm)
 
     return out
 
@@ -152,6 +165,7 @@ def compute_partner_kinematics(
     df_self: pd.DataFrame,
     df_partner: pd.DataFrame,
     fps: float = 25.0,
+    px_per_cm: float = 0.0,
 ) -> pd.DataFrame:
     """Add egocentric partner-relative metrics to *df_self*.
 
@@ -241,6 +255,9 @@ def compute_partner_kinematics(
         out["partner_ego_y"] = np.nan
         out["partner_proximity_index"] = np.nan
 
+    if px_per_cm > 0:
+        _append_calibrated_metric_columns(out, px_per_cm)
+
     return out
 
 
@@ -271,7 +288,47 @@ def _get_body_centre(
 
 # ── Per-bodypart speed / acceleration ─────────────────────────────────────────
 
-def _add_speed_accel(df: pd.DataFrame, bp: str, fps: float) -> None:
+def _frame_dt(n: int, fps: float, time_s: Optional[np.ndarray]) -> Optional[np.ndarray]:
+    if time_s is None:
+        return None
+    times = np.asarray(time_s, dtype=np.float64).reshape(-1)
+    if len(times) < n:
+        return None
+    times = times[:n]
+    fallback = 1.0 / max(float(fps), 1e-9)
+    dt = np.diff(times, prepend=np.nan)
+    dt[0] = fallback
+    invalid = (~np.isfinite(dt)) | (dt <= 0)
+    dt[invalid] = fallback
+    return dt
+
+
+def _coerce_dt(dt: Optional[np.ndarray], n: int, fps: float) -> np.ndarray:
+    fallback = 1.0 / max(float(fps), 1e-9)
+    if dt is None:
+        return np.full(n, fallback, dtype=np.float64)
+    arr = np.asarray(dt, dtype=np.float64).reshape(-1)
+    if len(arr) < n:
+        out = np.full(n, fallback, dtype=np.float64)
+        out[: len(arr)] = arr
+        arr = out
+    else:
+        arr = arr[:n].copy()
+    invalid = (~np.isfinite(arr)) | (arr <= 0)
+    arr[invalid] = fallback
+    return arr
+
+
+def _safe_divide(numer: np.ndarray, denom: np.ndarray) -> np.ndarray:
+    numer_arr = np.asarray(numer, dtype=np.float64)
+    denom_arr = np.asarray(denom, dtype=np.float64)
+    out = np.full_like(numer_arr, np.nan, dtype=np.float64)
+    valid = np.isfinite(numer_arr) & np.isfinite(denom_arr) & (denom_arr > 0)
+    np.divide(numer_arr, denom_arr, out=out, where=valid)
+    return out
+
+
+def _add_speed_accel(df: pd.DataFrame, bp: str, fps: float, dt: Optional[np.ndarray] = None) -> None:
     x_col = f"{bp}_x"
     y_col = f"{bp}_y"
     if x_col not in df.columns or y_col not in df.columns:
@@ -283,10 +340,10 @@ def _add_speed_accel(df: pd.DataFrame, bp: str, fps: float) -> None:
     dx = np.diff(x, prepend=x[0])
     dy = np.diff(y, prepend=y[0])
     speed_pf = np.hypot(dx, dy)          # px / frame
-    speed_ps = speed_pf * fps            # px / s
+    step_dt = _coerce_dt(dt, len(speed_pf), fps)
+    speed_ps = _safe_divide(speed_pf, step_dt)
 
-    accel_pf = np.diff(speed_pf, prepend=speed_pf[0])
-    accel_ps = accel_pf * fps
+    accel_ps = _safe_divide(np.diff(speed_ps, prepend=speed_ps[0]), step_dt)
 
     df[f"{bp}_speed_px_s"]  = speed_ps
     df[f"{bp}_accel_px_s2"] = accel_ps
@@ -295,11 +352,11 @@ def _add_speed_accel(df: pd.DataFrame, bp: str, fps: float) -> None:
 # ── Body-centre speed (from pre-computed cx, cy) ─────────────────────────────
 
 def _add_body_speed_from_centre(
-    df: pd.DataFrame, cx: np.ndarray, cy: np.ndarray, fps: float
+    df: pd.DataFrame, cx: np.ndarray, cy: np.ndarray, fps: float, dt: Optional[np.ndarray] = None
 ) -> None:
     dx = np.diff(cx, prepend=cx[0])
     dy = np.diff(cy, prepend=cy[0])
-    df["body_speed_px_s"] = np.hypot(dx, dy) * fps
+    df["body_speed_px_s"] = _safe_divide(np.hypot(dx, dy), _coerce_dt(dt, len(cx), fps))
 
 
 # ── Legacy wrapper (kept for backwards compat if called externally) ───────────
@@ -314,25 +371,23 @@ def _add_body_speed(df: pd.DataFrame, bodyparts: list[str], fps: float) -> None:
 # ── Body-centre acceleration & jerk ──────────────────────────────────────────
 
 def _add_body_acceleration(
-    df: pd.DataFrame, cx: np.ndarray, cy: np.ndarray, fps: float
+    df: pd.DataFrame, cx: np.ndarray, cy: np.ndarray, fps: float, dt: Optional[np.ndarray] = None
 ) -> None:
     """Compute body acceleration (derivative of speed) and jerk (derivative of accel)."""
     dx = np.diff(cx, prepend=cx[0])
     dy = np.diff(cy, prepend=cy[0])
-    speed_pf = np.hypot(dx, dy)  # px / frame
+    speed_pf = np.hypot(dx, dy)
+    step_dt = _coerce_dt(dt, len(speed_pf), fps)
+    speed_ps = _safe_divide(speed_pf, step_dt)
 
-    # Acceleration: diff of speed, first value is NaN
-    accel_pf = np.empty_like(speed_pf)
-    accel_pf[0] = np.nan
-    accel_pf[1:] = np.diff(speed_pf)
-    accel_ps2 = accel_pf * fps * fps  # px/frame² → px/s²
+    accel_ps2 = np.empty_like(speed_ps)
+    accel_ps2[0] = np.nan
+    accel_ps2[1:] = _safe_divide(np.diff(speed_ps), step_dt[1:])
     df["body_accel_px_s2"] = accel_ps2
 
-    # Jerk: diff of acceleration, first two values are NaN
-    jerk_pf = np.empty_like(accel_pf)
-    jerk_pf[0:2] = np.nan
-    jerk_pf[2:] = np.diff(accel_pf[1:])  # diff of valid accel values
-    jerk_ps3 = jerk_pf * fps * fps * fps  # px/frame³ → px/s³
+    jerk_ps3 = np.empty_like(accel_ps2)
+    jerk_ps3[0:2] = np.nan
+    jerk_ps3[2:] = _safe_divide(np.diff(accel_ps2[1:]), step_dt[2:])
     df["body_jerk_px_s3"] = jerk_ps3
 
 
@@ -379,21 +434,22 @@ def _add_distance_traveled(
 
 # ── Freezing detection ───────────────────────────────────────────────────────
 
-def _add_freezing(
+def _add_immobility(
     df: pd.DataFrame,
     cx: np.ndarray,
     cy: np.ndarray,
     fps: float,
     threshold: float,
     min_frames: int,
+    dt: Optional[np.ndarray] = None,
 ) -> None:
-    """Detect freezing: speed < threshold for >= min_frames consecutive frames.
+    """Detect immobility: speed < threshold for >= min_frames consecutive frames.
 
     Uses numpy convolution for efficient rolling-window detection.
     """
     dx = np.diff(cx, prepend=cx[0])
     dy = np.diff(cy, prepend=cy[0])
-    speed_ps = np.hypot(dx, dy) * fps
+    speed_ps = _safe_divide(np.hypot(dx, dy), _coerce_dt(dt, len(cx), fps))
 
     below = (speed_ps < threshold).astype(np.float64)
 
@@ -403,13 +459,13 @@ def _add_freezing(
     kernel = np.ones(min_frames)
     rolling_sum = np.convolve(below, kernel, mode="same")
 
-    # A frame is "freezing" if it belongs to any window of min_frames
+    # A frame is "immobile" if it belongs to any window of min_frames
     # consecutive sub-threshold frames.  The convolution marks the centre
     # of each qualifying window, so we need to dilate by min_frames//2 in
     # each direction to mark all frames that participate.
     # Simpler correct approach: mark every frame that is part of a run of
     # >= min_frames consecutive sub-threshold frames.
-    freeze_mask = np.zeros(len(speed_ps), dtype=bool)
+    immobile_mask = np.zeros(len(speed_ps), dtype=bool)
     n = len(below)
     if n >= min_frames:
         # Find runs of below-threshold frames using diff on boolean
@@ -420,9 +476,21 @@ def _add_freezing(
         run_ends = np.where(diffs == -1)[0]
         for start, end in zip(run_starts, run_ends):
             if (end - start) >= min_frames:
-                freeze_mask[start:end] = True
+                immobile_mask[start:end] = True
 
-    df["freezing"] = freeze_mask
+    df["immobile"] = immobile_mask
+
+
+def _add_freezing(
+    df: pd.DataFrame,
+    cx: np.ndarray,
+    cy: np.ndarray,
+    fps: float,
+    threshold: float,
+    min_frames: int,
+) -> None:
+    """Backward-compatible wrapper for the old freezing metric name."""
+    _add_immobility(df, cx, cy, fps, threshold, min_frames)
 
 
 # ── Mobility state ───────────────────────────────────────────────────────────
@@ -434,6 +502,7 @@ def _add_mobility_state(
     fps: float,
     threshold: float,
     min_frames: int,
+    dt: Optional[np.ndarray] = None,
 ) -> None:
     """Classify each frame as "mobile" or "immobile".
 
@@ -452,7 +521,7 @@ def _add_mobility_state(
     else:
         dx = np.diff(cx, prepend=cx[0])
         dy = np.diff(cy, prepend=cy[0])
-        speed_ps = np.hypot(dx, dy) * fps
+        speed_ps = _safe_divide(np.hypot(dx, dy), _coerce_dt(dt, len(cx), fps))
 
     below = (speed_ps < threshold).astype(np.int8)
 
@@ -469,6 +538,7 @@ def _add_mobility_state(
                 immobile_mask[start:end] = True
 
     df["is_immobile"] = immobile_mask
+    df["is_mobile"] = ~immobile_mask
     df["mobility_state"] = np.where(immobile_mask, "immobile", "mobile")
 
 
@@ -630,6 +700,7 @@ def _add_rearing(
     cy: Optional[np.ndarray],
     elongation_factor: float = 1.6,
     min_frames: int = 5,
+    dt: Optional[np.ndarray] = None,
 ) -> None:
     """Detect rearing: body elongation significantly above median while speed is low.
 
@@ -661,7 +732,7 @@ def _add_rearing(
     elif cx is not None and cy is not None:
         dx = np.diff(cx, prepend=cx[0])
         dy = np.diff(cy, prepend=cy[0])
-        speed = np.hypot(dx, dy) * fps
+        speed = _safe_divide(np.hypot(dx, dy), _coerce_dt(dt, len(cx), fps))
     else:
         df["rearing"] = False
         return
@@ -690,6 +761,38 @@ def _add_rearing(
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _append_calibrated_metric_columns(df: pd.DataFrame, px_per_cm: float) -> None:
+    """Append cm-based metric aliases from pixel-based metric columns."""
+    if px_per_cm <= 0:
+        return
+
+    div_suffixes = [
+        ("_px_s3", "_cm_s3"),
+        ("_px_s2", "_cm_s2"),
+        ("_px_s", "_cm_s"),
+        ("_px", "_cm"),
+    ]
+    mul_suffixes = [
+        ("_1_px", "_1_cm"),
+    ]
+
+    for col in list(df.columns):
+        if not pd.api.types.is_numeric_dtype(df[col].dtype):
+            continue
+        if col in {"partner_ego_x", "partner_ego_y"}:
+            df[f"{col}_cm"] = df[col] / px_per_cm
+            continue
+        for src_suffix, dst_suffix in div_suffixes:
+            if col.endswith(src_suffix):
+                df[col[: -len(src_suffix)] + dst_suffix] = df[col] / px_per_cm
+                break
+        else:
+            for src_suffix, dst_suffix in mul_suffixes:
+                if col.endswith(src_suffix):
+                    df[col[: -len(src_suffix)] + dst_suffix] = df[col] * px_per_cm
+                    break
+
 
 def _pick_bp(bodyparts: list[str], candidates: list[str]) -> Optional[str]:
     """Return first candidate that exists in bodyparts (case-insensitive)."""

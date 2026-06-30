@@ -10,6 +10,7 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QDoubleSpinBox,
     QFormLayout,
+    QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
@@ -19,6 +20,8 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+from shared.ui_kit import Card, hint
 
 
 class KinematicsPanel(QGroupBox):
@@ -36,18 +39,61 @@ class KinematicsPanel(QGroupBox):
         self._setup_ui()
 
     def _setup_ui(self) -> None:
+        # Borderless transparent root: the side panel already shows the title and
+        # each section lives in its own Card. This keeps the panel flat and modern.
+        self.setObjectName("panelRoot")
+
         layout = QVBoxLayout(self)
-        layout.setSpacing(6)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(12)
+
+        # ── Settings card ────────────────────────────────────────────────
+        settings_card = Card("Settings", "Frame rate and unit calibration")
 
         form = QFormLayout()
-        form.setSpacing(5)
+        form.setSpacing(8)
+        form.setContentsMargins(0, 0, 0, 0)
 
         self._spin_fps = QDoubleSpinBox()
         self._spin_fps.setRange(1.0, 1000.0)
         self._spin_fps.setValue(30.0)
         self._spin_fps.setSuffix(" fps")
+        self._spin_fps.setFixedWidth(110)
         self._spin_fps.setToolTip("Video acquisition frame rate used to convert frame-based metrics to time-based units")
         form.addRow("Frame rate:", self._spin_fps)
+
+        settings_card.body.addLayout(form)
+        settings_card.body.addWidget(
+            hint("Used as a time fallback when no loaded frame times are available. "
+                 "Calibrate (px/cm) to unlock cm-based outputs.")
+        )
+        layout.addWidget(settings_card)
+
+        # ── Metrics card ─────────────────────────────────────────────────
+        metrics_card = Card("Metrics", "Select what to compute, then run")
+
+        # Preset buttons row at the top of the metrics card.
+        preset_row = QHBoxLayout()
+        preset_row.setSpacing(8)
+        btn_core = QPushButton("Core Preset")
+        btn_core.setObjectName("secondary")
+        btn_core.setToolTip("Enable the most common metrics for a quick first pass")
+        btn_core.clicked.connect(lambda: self._apply_metric_preset("core"))
+        preset_row.addWidget(btn_core)
+
+        btn_all = QPushButton("All Metrics")
+        btn_all.setObjectName("secondary")
+        btn_all.setToolTip("Enable every available kinematics metric")
+        btn_all.clicked.connect(lambda: self._apply_metric_preset("all"))
+        preset_row.addWidget(btn_all)
+
+        btn_min = QPushButton("Minimal")
+        btn_min.setObjectName("secondary")
+        btn_min.setToolTip("Keep only the essential locomotion/orientation metrics enabled")
+        btn_min.clicked.connect(lambda: self._apply_metric_preset("minimal"))
+        preset_row.addWidget(btn_min)
+        preset_row.addStretch()
+        metrics_card.body.addLayout(preset_row)
 
         self._chk_perbp = QCheckBox("Per-bodypart speed/accel")
         self._chk_perbp.setChecked(False)
@@ -86,62 +132,70 @@ class KinematicsPanel(QGroupBox):
         self._chk_partner.setChecked(False)
         self._chk_partner.setToolTip("Egocentric distance, angle, and proximity index to the partner animal")
 
-        layout.addLayout(form)
-        layout.addWidget(self._chk_perbp)
-        layout.addWidget(self._chk_body)
-        layout.addWidget(self._chk_orient)
-        layout.addWidget(self._chk_accel)
-        layout.addWidget(self._chk_distance)
-        layout.addWidget(self._chk_immobile)
-        layout.addWidget(self._chk_tortuosity)
-        layout.addWidget(self._chk_elongation)
-        layout.addWidget(self._chk_curvature)
-        layout.addWidget(self._chk_headdir)
-        layout.addWidget(self._chk_rearing)
-        layout.addWidget(self._chk_partner)
+        # Tidy two-column grid so the metric list reads as a compact block
+        # instead of one tall, thin column.
+        metrics_grid = QGridLayout()
+        metrics_grid.setHorizontalSpacing(18)
+        metrics_grid.setVerticalSpacing(8)
+        metrics_grid.setContentsMargins(0, 2, 0, 0)
+        metric_checks = [
+            self._chk_perbp,
+            self._chk_body,
+            self._chk_orient,
+            self._chk_accel,
+            self._chk_distance,
+            self._chk_immobile,
+            self._chk_tortuosity,
+            self._chk_elongation,
+            self._chk_curvature,
+            self._chk_headdir,
+            self._chk_rearing,
+            self._chk_partner,
+        ]
+        n_rows = (len(metric_checks) + 1) // 2
+        for idx, chk in enumerate(metric_checks):
+            row = idx % n_rows
+            col = idx // n_rows
+            metrics_grid.addWidget(chk, row, col)
+        metrics_grid.setColumnStretch(0, 1)
+        metrics_grid.setColumnStretch(1, 1)
+        metrics_card.body.addLayout(metrics_grid)
+        layout.addWidget(metrics_card)
 
-        preset_row = QHBoxLayout()
-        btn_core = QPushButton("Core Preset")
-        btn_core.setObjectName("secondary")
-        btn_core.setToolTip("Enable the most common metrics for a quick first pass")
-        btn_core.clicked.connect(lambda: self._apply_metric_preset("core"))
-        preset_row.addWidget(btn_core)
-
-        btn_all = QPushButton("All Metrics")
-        btn_all.setObjectName("secondary")
-        btn_all.setToolTip("Enable every available kinematics metric")
-        btn_all.clicked.connect(lambda: self._apply_metric_preset("all"))
-        preset_row.addWidget(btn_all)
-
-        btn_min = QPushButton("Minimal")
-        btn_min.setObjectName("secondary")
-        btn_min.setToolTip("Keep only the essential locomotion/orientation metrics enabled")
-        btn_min.clicked.connect(lambda: self._apply_metric_preset("minimal"))
-        preset_row.addWidget(btn_min)
-        preset_row.addStretch()
-        layout.addLayout(preset_row)
+        # ── Actions card ─────────────────────────────────────────────────
+        actions_card = Card("Run", "Compute metrics and explore positions")
 
         btn_row = QHBoxLayout()
+        btn_row.setSpacing(8)
         self._btn_compute = QPushButton("Compute Kinematics")
         self._btn_compute.clicked.connect(self._compute)
         btn_row.addWidget(self._btn_compute)
 
         self._btn_heatmap = QPushButton("Position Map")
+        self._btn_heatmap.setObjectName("secondary")
         self._btn_heatmap.setToolTip("Egocentric position heatmap for the partner animal")
         self._btn_heatmap.clicked.connect(self.heatmap_requested.emit)
         btn_row.addWidget(self._btn_heatmap)
-        layout.addLayout(btn_row)
+        actions_card.body.addLayout(btn_row)
 
         self._lbl_status = QLabel("")
+        self._lbl_status.setObjectName("hint")
         self._lbl_status.setWordWrap(True)
-        self._lbl_status.setStyleSheet("color: #a6adc8; font-size: 11px;")
-        layout.addWidget(self._lbl_status)
+        actions_card.body.addWidget(self._lbl_status)
+        layout.addWidget(actions_card)
+
+        # ── Results card ─────────────────────────────────────────────────
+        results_card = Card("Results", "Per-animal metric summary")
 
         self._table = QTableWidget(0, 4)
         self._table.setHorizontalHeaderLabels(["Animal", "Metric", "Mean", "Max"])
-        self._table.setMaximumHeight(160)
+        self._table.setMinimumHeight(200)
+        self._table.setMaximumHeight(200)
         self._table.horizontalHeader().setStretchLastSection(True)
-        layout.addWidget(self._table)
+        results_card.body.addWidget(self._table)
+        layout.addWidget(results_card)
+
+        layout.addStretch()
         self._update_ui_state()
 
     def fps(self) -> float:
@@ -315,7 +369,7 @@ class KinematicsPanel(QGroupBox):
                 rows.append((aid, "immobile", pct, f"{immobile_frames} fr"))
 
         self._table.setRowCount(len(rows))
-        self._table.setMaximumHeight(max(160, 22 * len(rows) + 30))
+        self._table.setMaximumHeight(max(200, 22 * len(rows) + 30))
         for row_idx, row in enumerate(rows):
             for col_idx, value in enumerate(row):
                 self._table.setItem(row_idx, col_idx, QTableWidgetItem(value))

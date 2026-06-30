@@ -1,7 +1,13 @@
 """QThread worker that renders DLC keypoint overlays onto video frames.
 
-Each rendered frame is emitted as a QImage signal for display in the UI.
-Behaviour subtitles are drawn as a banner at the bottom of the frame.
+Rendering is delegated to :mod:`dlc_processor.core.overlay_renderer` (pure
+drawing). This worker's job is the *data* side: resolving the data row for a
+given video frame, extracting keypoints, mapping detected behaviours to the
+animals they describe, and computing a per-animal confidence score so the
+overlay can show broadcast-style badges such as ``M1: nose-to-nose 0.59``.
+
+The same :class:`OverlayWorker._render` method powers both the live video
+preview and the offline export worker, so improving it upgrades both at once.
 
 Emits
 -----
@@ -20,37 +26,9 @@ from PySide6.QtCore import QThread, Signal
 from PySide6.QtGui import QImage
 
 from dlc_processor.core.dlc_loader import get_bodyparts
+from dlc_processor.core import overlay_renderer as _orr
 
 logger = logging.getLogger(__name__)
-
-# Pastel colour palette (BGR) for up to 8 animals
-_ANIMAL_COLORS_BGR = [
-    (255, 120, 50),    # blue
-    (50, 200, 255),    # orange
-    (80, 240, 80),     # green
-    (80, 80, 255),     # red
-    (240, 100, 240),   # pink
-    (240, 240, 80),    # cyan
-    (150, 80, 240),    # purple
-    (80, 200, 200),    # yellow-green
-]
-
-# Subtitle pill colours (BGR) — matches Gantt palette order
-_SUBTITLE_COLORS_BGR = [
-    (168, 139, 243),   # pink-red
-    (250, 180, 137),   # blue
-    (161, 227, 166),   # green
-    (135, 179, 250),   # peach/orange
-    (247, 166, 203),   # mauve
-    (175, 226, 249),   # yellow
-    (213, 226, 148),   # teal
-    (231, 194, 245),   # pink
-    (236, 199, 116),   # sapphire
-]
-
-# Keypoint circle radius
-_KP_RADIUS = 5
-_KP_THICKNESS = -1
 
 # Skeleton connections — default mouse layout.
 # resolve_skeleton_edges() filters out edges whose bodyparts are absent,
@@ -107,22 +85,17 @@ def resolve_skeleton_edges(
     Uses exact match first, then case-insensitive match, then alias lookup.
     Returns only edges where both bodyparts are found.
     """
-    # Build lookup: canonical -> actual name in data
     bp_set = set(available_bps)
     bp_lower = {bp.lower(): bp for bp in available_bps}
 
     def _resolve(name: str) -> Optional[str]:
-        # Exact match
         if name in bp_set:
             return name
-        # Case-insensitive match
         actual = bp_lower.get(name.lower())
         if actual:
             return actual
-        # Alias lookup
         for canonical, aliases in _BP_ALIASES.items():
             if name == canonical or name in aliases:
-                # Try to find canonical or any alias in data
                 if canonical in bp_set:
                     return canonical
                 cand = bp_lower.get(canonical.lower())
@@ -166,6 +139,29 @@ class OverlayWorker(QThread):
         skeleton_edges: Optional[list[tuple[str, str]]] = None,
         parent=None,
     ) -> None:
+        """Initialise the worker.
+
+        Args:
+            video_path: Absolute path to the source video file.
+            animal_dfs: Mapping of animal ID to its DLC keypoint DataFrame.
+                Each DataFrame is expected to have columns of the form
+                ``<bodypart>_x``, ``<bodypart>_y``, and
+                ``<bodypart>_likelihood``.
+            behavior_arrays: Optional mapping of behaviour key to a boolean
+                numpy array aligned to the same row index as the DataFrames.
+                Only rows where the value is ``True`` produce a badge.
+            start_frame: First video frame to render (inclusive).
+            end_frame: Last video frame to render (exclusive). Defaults to the
+                total frame count reported by OpenCV.
+            draw_skeleton: Whether to draw limb edges between keypoints.
+            draw_labels: Whether to draw the small animal-name tag near each
+                body centroid.
+            draw_behaviors: Whether to draw behaviour badges.
+            skeleton_edges: Custom edge list overriding the built-in mouse
+                skeleton. Use this when the DLC project has non-standard
+                bodypart names not covered by ``_BP_ALIASES``.
+            parent: Optional Qt parent object.
+        """
         super().__init__(parent)
         self.video_path      = video_path
         self.animal_dfs      = animal_dfs
@@ -176,12 +172,29 @@ class OverlayWorker(QThread):
         self.draw_labels     = draw_labels
         self.draw_behaviors  = draw_behaviors
         self.skeleton_edges  = skeleton_edges
+        # Premium rendering defaults (read via getattr in _render, so callers
+        # that build the worker with __new__ inherit these too).
+        self.draw_keypoints  = True
         self.fill_body       = False
+        self.outline         = True
+        self.line_thickness  = 2
+        self.kp_radius       = 4
+        self.font_scale      = 0.0          # 0 -> auto from frame width
+        self.badge_mode      = "per_animal"  # "per_animal" | "banner"
+        self.show_scores     = True
+        self.max_badges_per_animal = 4
+        self.animal_label_mode = "id"       # "id" | "mouse" | "none"
         self.frame_index_mode = "video"
         self._abort          = False
         self._seek_frame: Optional[int] = None    # for single-frame seek
 
     def abort(self) -> None:
+        """Signal the run loop to stop after the current frame.
+
+        Thread-safe: sets a plain Python bool that the run loop checks at
+        the top of each iteration. The loop exits cleanly without terminating
+        the OS thread forcefully.
+        """
         self._abort = True
 
     def seek(self, frame_idx: int) -> None:
@@ -189,6 +202,15 @@ class OverlayWorker(QThread):
         self._seek_frame = frame_idx
 
     def run(self) -> None:
+        """Main QThread entry point: decode frames and emit rendered QImages.
+
+        Opens the video at ``video_path``, seeks to ``start_frame``, and
+        iterates forward frame by frame until ``end_frame`` or an abort
+        signal. A pending seek request (set via :meth:`seek`) is serviced on
+        the next iteration so a UI scrub does not block the main thread.
+        Emits :attr:`frame_ready` for every rendered frame and
+        :attr:`finished` when done (even on error).
+        """
         cap = cv2.VideoCapture(self.video_path)
         if not cap.isOpened():
             logger.error("Cannot open video: %s", self.video_path)
@@ -205,7 +227,6 @@ class OverlayWorker(QThread):
             if self._abort:
                 break
 
-            # Support single-frame seek request
             if self._seek_frame is not None:
                 target = self._seek_frame
                 self._seek_frame = None
@@ -229,132 +250,171 @@ class OverlayWorker(QThread):
     # ── rendering ─────────────────────────────────────────────────────────────
 
     def _render(self, frame: np.ndarray, fi: int, animals: list[str]) -> np.ndarray:
+        """Paint the premium overlay for frame *fi* onto a copy of *frame*."""
         out = frame.copy()
-        fh, fw = out.shape[:2]
+        mode = getattr(self, "frame_index_mode", "video")
 
+        # Resolve skeleton edge names against actual bodypart names.
         raw_edges = self.skeleton_edges if self.skeleton_edges else _SKELETON_EDGES
-
-        # Resolve skeleton edge names against actual bodypart names
         if animals and animals[0] in self.animal_dfs:
             all_bps = get_bodyparts(self.animal_dfs[animals[0]])
             edges = resolve_skeleton_edges(raw_edges, all_bps)
         else:
-            edges = raw_edges
+            edges = list(raw_edges)
 
+        # Use getattr with defaults throughout so that workers constructed
+        # via __new__ (e.g. in tests) still receive sensible values even
+        # when __init__ was never called.
+        style = _orr.OverlayStyle(
+            draw_skeleton=getattr(self, "draw_skeleton", True),
+            draw_keypoints=getattr(self, "draw_keypoints", True),
+            draw_labels=getattr(self, "draw_labels", True),
+            draw_behaviors=getattr(self, "draw_behaviors", True),
+            fill_body=getattr(self, "fill_body", False),
+            outline=getattr(self, "outline", True),
+            line_thickness=int(getattr(self, "line_thickness", 2)),
+            kp_radius=int(getattr(self, "kp_radius", 4)),
+            badge_mode=getattr(self, "badge_mode", "per_animal"),
+            max_badges_per_animal=int(getattr(self, "max_badges_per_animal", 4)),
+            font_scale=float(getattr(self, "font_scale", 0.0)),
+        )
+
+        show_scores = bool(getattr(self, "show_scores", True))
+        label_mode = getattr(self, "animal_label_mode", "id")
+
+        behavior_idx = self._behavior_row_index(fi, animals, mode)
+        badges = (
+            self._behavior_badges(animals, behavior_idx, show_scores)
+            if style.draw_behaviors else {}
+        )
+
+        draws: list[_orr.AnimalDraw] = []
         for ai, animal_id in enumerate(animals):
-            df = self.animal_dfs[animal_id]
-            row_idx = _resolve_data_row(df, fi, getattr(self, "frame_index_mode", "video"))
+            df = self.animal_dfs.get(animal_id)
+            if df is None:
+                continue
+            row_idx = _resolve_data_row(df, fi, mode)
             if row_idx is None:
                 continue
-            color = _ANIMAL_COLORS_BGR[ai % len(_ANIMAL_COLORS_BGR)]
-            row   = df.iloc[row_idx]
-            bps   = get_bodyparts(df)
-
+            row = df.iloc[row_idx]
             kp_coords: dict[str, tuple[int, int]] = {}
-            for bp in bps:
-                x = row.get(f"{bp}_x", np.nan)
-                y = row.get(f"{bp}_y", np.nan)
-                if np.isnan(x) or np.isnan(y):
+            for bp in get_bodyparts(df):
+                try:
+                    x = float(row.get(f"{bp}_x", np.nan))
+                    y = float(row.get(f"{bp}_y", np.nan))
+                except (TypeError, ValueError):
                     continue
-                ix, iy = int(round(x)), int(round(y))
-                kp_coords[bp] = (ix, iy)
+                if np.isfinite(x) and np.isfinite(y):
+                    kp_coords[bp] = (int(round(x)), int(round(y)))
 
-            # Body fill (convex hull) — drawn first so circles/lines appear on top
-            if getattr(self, 'fill_body', False) and len(kp_coords) >= 3:
-                pts = np.array(list(kp_coords.values()), dtype=np.int32)
-                hull = cv2.convexHull(pts)
-                fill_color = tuple(min(255, c + 80) for c in color)
-                overlay = out.copy()
-                cv2.fillConvexPoly(overlay, hull, fill_color)
-                cv2.addWeighted(overlay, 0.3, out, 0.7, 0, out)
+            if label_mode == "mouse":
+                label = f"M{ai + 1}"
+            elif label_mode == "none":
+                label = ""
+            else:
+                label = str(animal_id)
 
-            # Draw keypoint circles
-            for bp, (ix, iy) in kp_coords.items():
-                cv2.circle(out, (ix, iy), _KP_RADIUS, color, _KP_THICKNESS)
+            draws.append(_orr.AnimalDraw(
+                keypoints=kp_coords,
+                color=_orr.animal_color(ai),
+                label=label,
+                badges=badges.get(ai, []),
+            ))
 
-            if self.draw_skeleton:
-                for bp1, bp2 in edges:
-                    if bp1 in kp_coords and bp2 in kp_coords:
-                        cv2.line(out, kp_coords[bp1], kp_coords[bp2], color, 2)
-
-            if self.draw_labels and kp_coords:
-                cx = int(np.mean([v[0] for v in kp_coords.values()]))
-                cy = int(np.mean([v[1] for v in kp_coords.values()]))
-                label = animal_id
-
-                # Mobility state indicator
-                is_immobile_val = row.get("is_immobile", None)
-                if is_immobile_val is not None and not (
-                    isinstance(is_immobile_val, float) and np.isnan(is_immobile_val)
-                ):
-                    immobile = bool(is_immobile_val)
-                    dot_color = (80, 80, 255) if immobile else (80, 240, 80)  # red / green BGR
-                    dot_x = cx + len(animal_id) * 7 + 4
-                    dot_y = cy - 16
-                    cv2.circle(out, (dot_x, dot_y), 5, dot_color, -1)
-
-                cv2.putText(
-                    out, label,
-                    (cx - 20, cy - 12),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2, cv2.LINE_AA,
-                )
-
-        # Behaviour subtitle pills — each active behaviour gets a colored badge
-        draw_behaviors = getattr(self, "draw_behaviors", True)
-        if draw_behaviors:
-            behavior_idx = fi
-            if animals and animals[0] in self.animal_dfs:
-                resolved_idx = _resolve_data_row(
-                    self.animal_dfs[animals[0]],
-                    fi,
-                    getattr(self, "frame_index_mode", "video"),
-                )
-                if resolved_idx is None:
-                    behavior_idx = -1
-                else:
-                    behavior_idx = resolved_idx
-            all_bool_names = [
-                name for name, arr in self.behavior_arrays.items()
-                if arr.dtype == bool
-            ]
-            active = [
-                (name, all_bool_names.index(name))
-                for name in all_bool_names
-                if 0 <= behavior_idx < len(self.behavior_arrays[name])
-                and self.behavior_arrays[name][behavior_idx]
-            ]
-            if active:
-                pill_h = 34
-                pad_y = 6
-                font_scale = 0.7
-                thickness = 2
-                margin_x = fw // 2   # centre pills horizontally
-                y_bottom = fh - 10
-
-                for name, color_idx in reversed(active):
-                    label = _pretty_behavior_name(name)
-                    bgr = _SUBTITLE_COLORS_BGR[color_idx % len(_SUBTITLE_COLORS_BGR)]
-                    (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
-                    pill_w = tw + 20
-                    x1 = margin_x - pill_w // 2
-                    y1 = y_bottom - pill_h
-                    x2 = x1 + pill_w
-                    y2 = y_bottom
-
-                    # Semi-transparent filled rectangle
-                    overlay = out.copy()
-                    cv2.rectangle(overlay, (x1, y1), (x2, y2), bgr, -1)
-                    cv2.addWeighted(overlay, 0.75, out, 0.25, 0, out)
-
-                    # White text centred in pill
-                    tx = x1 + (pill_w - tw) // 2
-                    ty = y2 - (pill_h - th) // 2
-                    cv2.putText(out, label, (tx, ty),
-                                cv2.FONT_HERSHEY_SIMPLEX, font_scale,
-                                (255, 255, 255), thickness, cv2.LINE_AA)
-                    y_bottom = y1 - pad_y
-
+        try:
+            _orr.render_overlay(out, draws, edges, style)
+        except Exception:
+            logger.warning("Overlay rendering failed for frame %d", fi, exc_info=True)
+            return frame
         return out
+
+    # ── behaviour -> animal attribution ───────────────────────────────────────
+
+    def _behavior_row_index(self, fi: int, animals: list[str], mode: str) -> int:
+        """Resolve the behaviour-array row index for video frame *fi*."""
+        if animals and animals[0] in self.animal_dfs:
+            idx = _resolve_data_row(self.animal_dfs[animals[0]], fi, mode)
+            return -1 if idx is None else int(idx)
+        return int(fi)
+
+    def _behavior_badges(
+        self, animals: list[str], behavior_idx: int, show_scores: bool,
+    ) -> dict[int, list[str]]:
+        """Return ``{animal_index: [badge_text, ...]}`` for the active behaviours."""
+        result: dict[int, list[str]] = {}
+        if behavior_idx < 0 or not self.behavior_arrays:
+            return result
+
+        # Only boolean-dtype arrays are treated as behaviour masks. Float or
+        # integer probability arrays (e.g. raw LISBET scores) are intentionally
+        # skipped here; callers that want probability-thresholded badges should
+        # convert to bool before passing via behavior_arrays.
+        active = [
+            name for name, arr in self.behavior_arrays.items()
+            if getattr(arr, "dtype", None) == bool
+            and 0 <= behavior_idx < len(arr) and bool(arr[behavior_idx])
+        ]
+        if not active:
+            return result
+
+        scores: dict[int, Optional[float]] = {}
+        if show_scores:
+            for ai, aid in enumerate(animals):
+                scores[ai] = self._animal_likelihood(aid, behavior_idx)
+
+        for name in active:
+            pretty = _pretty_behavior_name(name)
+            for ai in self._animals_for_behavior(name, animals):
+                text = f"M{ai + 1}: {pretty}"
+                score = scores.get(ai) if show_scores else None
+                if score is not None:
+                    text = f"{text} {score:.2f}"
+                result.setdefault(ai, []).append(text)
+        return result
+
+    def _animals_for_behavior(self, name: str, animals: list[str]) -> list[int]:
+        """Map a behaviour key to the animal indices it describes.
+
+        - ``"<animal_id>__immobile"`` -> that animal only.
+        - ``"a_..._b"`` -> the first animal (A); ``"b_..._a"`` -> the second (B).
+        - everything else is treated as a mutual/pairwise behaviour (e.g.
+          ``nose2nose``) and shown on both animals of the pair.
+        """
+        n = len(animals)
+        if "__" in name:
+            prefix = name.split("__", 1)[0]
+            for ai, aid in enumerate(animals):
+                if str(aid) == prefix:
+                    return [ai]
+            # Prefix found but no animal ID matched (e.g. the animal was
+            # renamed after the behaviour arrays were created). Fall back to
+            # both animals of the pair rather than silently dropping the badge.
+            return list(range(min(n, 2)))
+        low = name.lower()
+        if low.startswith("a_"):
+            return [0] if n >= 1 else []
+        if low.startswith("b_"):
+            return [1] if n >= 2 else [0]
+        return list(range(min(n, 2)))
+
+    def _animal_likelihood(self, animal_id: str, row_idx: int) -> Optional[float]:
+        """Mean keypoint likelihood for an animal at *row_idx*, in [0, 1]."""
+        df = self.animal_dfs.get(animal_id)
+        if df is None or row_idx < 0 or row_idx >= len(df):
+            return None
+        row = df.iloc[row_idx]
+        vals: list[float] = []
+        for col in df.columns:
+            if isinstance(col, str) and col.endswith("_likelihood"):
+                try:
+                    v = float(row[col])
+                except (TypeError, ValueError, KeyError):
+                    continue
+                if np.isfinite(v):
+                    vals.append(v)
+        if not vals:
+            return None
+        return float(np.clip(np.mean(vals), 0.0, 1.0))
 
 
 def _to_qimage(frame_bgr: np.ndarray) -> QImage:
@@ -366,25 +426,47 @@ def _to_qimage(frame_bgr: np.ndarray) -> QImage:
 
 
 def _resolve_data_row(df, frame_idx: int, mode: str) -> Optional[int]:
+    """Translate a video frame index to the corresponding DataFrame row index.
+
+    Two indexing modes are supported:
+
+    - ``"row"``: treat *frame_idx* as a direct 0-based row number. Used when
+      the CSV was not subsampled and every row corresponds to one video frame
+      in order.
+    - ``"video"`` (default): look up the exact frame number stored in
+      ``df.attrs["frame_numbers"]``. This handles subsampled or
+      non-contiguous exports where the CSV rows do not align 1-to-1 with
+      video frames.
+
+    Optimisation: if the stored frame-number array is a contiguous run (all
+    differences equal 1) a simple subtraction replaces a binary search.
+
+    Returns the integer row index, or ``None`` if *frame_idx* is out of range
+    or cannot be matched.
+    """
     if mode == "row":
         row_idx = int(frame_idx)
         return row_idx if 0 <= row_idx < len(df) else None
 
     frames = getattr(df, "attrs", {}).get("frame_numbers")
     if frames is None:
+        # No frame-number metadata: assume rows are contiguous from frame 0.
         row_idx = int(frame_idx)
         return row_idx if 0 <= row_idx < len(df) else None
 
     arr = np.asarray(frames, dtype=np.int64).reshape(-1)
     if len(arr) != len(df) or len(arr) == 0:
+        # Metadata length mismatch: fall back to direct row indexing.
         row_idx = int(frame_idx)
         return row_idx if 0 <= row_idx < len(df) else None
 
     target = int(frame_idx)
     if len(arr) > 1 and np.all(np.diff(arr) == 1):
+        # Fast path: contiguous frame numbers, no search needed.
         row_idx = target - int(arr[0])
         return row_idx if 0 <= row_idx < len(arr) else None
 
+    # General path: binary search for the exact frame number.
     pos = int(np.searchsorted(arr, target))
     if 0 <= pos < len(arr) and int(arr[pos]) == target:
         return pos
@@ -392,6 +474,14 @@ def _resolve_data_row(df, frame_idx: int, mode: str) -> Optional[int]:
 
 
 def _pretty_behavior_name(name: str) -> str:
+    """Convert a raw behaviour key to a human-readable display string.
+
+    Handles two cases before consulting the lookup table:
+    - ``"<animal>__immobile"`` / ``"<animal>__mobile"``: expand the
+      ``__``-separated form to ``"<animal> immobile"`` etc.
+    - Everything else: look up in the ``pretty`` dict, then fall back to
+      replacing underscores with spaces so arbitrary keys still look tidy.
+    """
     if "__" in name:
         animal, metric = name.split("__", 1)
         if metric in {"immobile", "is_immobile"}:

@@ -13,18 +13,47 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QFileDialog,
+    QFormLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QProgressBar,
     QPushButton,
+    QSizePolicy,
     QSpinBox,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
+
+from shared.ui_kit import COLORS, Card, hint
+
+# Form alignment + calm field widths so combos / numeric inputs sit in a tidy
+# right-aligned column instead of stretching across the whole card.
+_FORM_LABEL_ALIGN = Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+_FORM_ALIGN = Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop
+_FIELD_WIDTH = 150
+_NUM_WIDTH = 120
+
+
+def _make_form() -> QFormLayout:
+    """Build a consistently styled, right-aligned form layout."""
+    form = QFormLayout()
+    form.setSpacing(8)
+    form.setHorizontalSpacing(12)
+    form.setLabelAlignment(_FORM_LABEL_ALIGN)
+    form.setFormAlignment(_FORM_ALIGN)
+    form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.FieldsStayAtSizeHint)
+    return form
+
+
+def _fixed(widget: QWidget, width: int = _FIELD_WIDTH) -> QWidget:
+    """Constrain a control to a fixed, premium-looking column width."""
+    widget.setFixedWidth(width)
+    widget.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+    return widget
 
 
 _META_COLUMNS = [
@@ -53,23 +82,26 @@ class BatchPanel(QGroupBox):
 
     def _setup_ui(self) -> None:
         layout = QVBoxLayout(self)
-        layout.setSpacing(6)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(12)
 
-        info = QLabel(
-            "Compute framewise metrics and social behaviours for all loaded recordings. "
-            "Metadata is saved into the exported tables and used for grouped summaries."
+        # ── Metadata table + import/export ─────────────────────────────────
+        meta_card = Card(
+            "Recording metadata",
+            "Edit subject / group fields used in exported tables and grouped summaries",
+            accent=COLORS["teal"],
         )
-        info.setWordWrap(True)
-        info.setStyleSheet("color:#a6adc8; font-size:11px;")
-        layout.addWidget(info)
 
         self._table = QTableWidget(0, len(_META_COLUMNS))
         self._table.setHorizontalHeaderLabels([_metadata_header(c) for c in _META_COLUMNS])
         self._table.horizontalHeader().setStretchLastSection(True)
+        self._table.verticalHeader().setVisible(False)
         self._table.setMinimumHeight(180)
-        layout.addWidget(self._table, 1)
+        self._table.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
+        meta_card.body.addWidget(self._table)
 
         meta_btns = QHBoxLayout()
+        meta_btns.setSpacing(8)
         btn_refresh = QPushButton("Refresh Loaded Rows")
         btn_refresh.setObjectName("secondary")
         btn_refresh.clicked.connect(lambda: self.set_records(self._records))
@@ -83,37 +115,34 @@ class BatchPanel(QGroupBox):
         btn_export.clicked.connect(self._export_metadata)
         meta_btns.addWidget(btn_export)
         meta_btns.addStretch()
-        layout.addLayout(meta_btns)
+        meta_card.body.addLayout(meta_btns)
+        meta_card.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
+        layout.addWidget(meta_card, 1)
 
-        compute_grp = QGroupBox("Batch Compute")
-        compute_lay = QVBoxLayout(compute_grp)
-        compute_lay.setSpacing(5)
+        # ── Processing options ─────────────────────────────────────────────
+        opts_card = Card("Processing options", "What to compute for every loaded recording")
 
-        opts_row = QHBoxLayout()
         self._chk_social = QCheckBox("Compute social behaviours")
         self._chk_social.setChecked(True)
-        opts_row.addWidget(self._chk_social)
+        opts_card.body.addWidget(self._chk_social)
         self._chk_social_masks = QCheckBox("Use masks for social contact")
         self._chk_social_masks.setChecked(False)
         self._chk_social_masks.setToolTip("Use segmentation masks during social behaviour export; slower on long videos")
-        opts_row.addWidget(self._chk_social_masks)
+        opts_card.body.addWidget(self._chk_social_masks)
         self._chk_fix_mask_identity = QCheckBox("Fix identities from masks first")
         self._chk_fix_mask_identity.setChecked(False)
         self._chk_fix_mask_identity.setToolTip(
             "Before computing metrics, use paired COCO mask track IDs as identity ground truth for every loaded recording"
         )
-        opts_row.addWidget(self._chk_fix_mask_identity)
+        opts_card.body.addWidget(self._chk_fix_mask_identity)
         self._chk_summary = QCheckBox("Generate grouped summary tables + figures")
         self._chk_summary.setChecked(True)
-        opts_row.addWidget(self._chk_summary)
+        opts_card.body.addWidget(self._chk_summary)
         self._chk_position_maps = QCheckBox("Export averaged position maps")
         self._chk_position_maps.setChecked(True)
-        opts_row.addWidget(self._chk_position_maps)
-        opts_row.addStretch()
-        compute_lay.addLayout(opts_row)
+        opts_card.body.addWidget(self._chk_position_maps)
 
-        jobs_row = QHBoxLayout()
-        jobs_row.addWidget(QLabel("CPU jobs:"))
+        jobs_form = _make_form()
         self._spin_jobs = QSpinBox()
         self._spin_jobs.setRange(0, max(1, int(os.cpu_count() or 1)))
         self._spin_jobs.setValue(0)
@@ -121,57 +150,92 @@ class BatchPanel(QGroupBox):
         self._spin_jobs.setToolTip(
             "Parallel CPU workers for batch metric/social export. Auto uses up to CPU count minus one."
         )
-        jobs_row.addWidget(self._spin_jobs)
-        jobs_row.addStretch()
-        compute_lay.addLayout(jobs_row)
+        _fixed(self._spin_jobs, _NUM_WIDTH)
+        jobs_form.addRow("CPU jobs", self._spin_jobs)
+        opts_card.body.addLayout(jobs_form)
+        layout.addWidget(opts_card)
 
-        window_row = QHBoxLayout()
+        # ── Frame window ───────────────────────────────────────────────────
+        window_card = Card("Frame window", "Optionally restrict analysis to a range of source frames")
+
         self._chk_time_window = QCheckBox("Analyze frame window")
         self._chk_time_window.setToolTip("Restrict batch metrics, social behavior, transitions, and position maps to source frame numbers.")
         self._chk_time_window.toggled.connect(lambda _checked: self._update_ui_state())
-        window_row.addWidget(self._chk_time_window)
-        window_row.addWidget(QLabel("Start frame:"))
+        window_card.body.addWidget(self._chk_time_window)
+
+        window_form = _make_form()
         self._spin_start_frame = QSpinBox()
         self._spin_start_frame.setRange(0, 2_000_000_000)
         self._spin_start_frame.setSingleStep(100)
         self._spin_start_frame.setToolTip("First source frame number to include.")
-        window_row.addWidget(self._spin_start_frame)
-        window_row.addWidget(QLabel("End frame:"))
+        _fixed(self._spin_start_frame, _NUM_WIDTH)
+        window_form.addRow("Start frame", self._spin_start_frame)
         self._spin_end_frame = QSpinBox()
         self._spin_end_frame.setRange(0, 2_000_000_000)
         self._spin_end_frame.setSpecialValueText("To end")
         self._spin_end_frame.setSingleStep(100)
         self._spin_end_frame.setToolTip("Last source frame number to include. Leave at 0 to continue to the last tracked frame.")
-        window_row.addWidget(self._spin_end_frame)
-        window_row.addStretch()
-        compute_lay.addLayout(window_row)
+        _fixed(self._spin_end_frame, _NUM_WIDTH)
+        window_form.addRow("End frame", self._spin_end_frame)
+        window_card.body.addLayout(window_form)
+        layout.addWidget(window_card)
 
-        summary_row = QHBoxLayout()
-        summary_row.addWidget(QLabel("Summary plot:"))
+        # ── Grouped summary ────────────────────────────────────────────────
+        summary_card = Card("Grouped summary", "How recordings are compared and plotted")
+
+        summary_form = _make_form()
         self._combo_plot_style = QComboBox()
         self._combo_plot_style.addItem("Boxplot + stripplot", "box_strip")
         self._combo_plot_style.addItem("Bar + stripplot", "bar_strip")
-        summary_row.addWidget(self._combo_plot_style)
-        summary_row.addWidget(QLabel("Stats:"))
+        _fixed(self._combo_plot_style)
+        summary_form.addRow("Summary plot", self._combo_plot_style)
         self._combo_comparison = QComboBox()
         self._combo_comparison.addItem("Holm multiple t-tests", "holm_ttest")
         self._combo_comparison.addItem("Tukey HSD", "tukey")
-        summary_row.addWidget(self._combo_comparison)
-        summary_row.addWidget(QLabel("Tab10 colors:"))
+        _fixed(self._combo_comparison)
+        summary_form.addRow("Stats", self._combo_comparison)
+        self._combo_group = QComboBox()
+        self._combo_group.addItem("Animal", "animal")
+        self._combo_group.addItem("Mouse ID", "mouseId")
+        self._combo_group.addItem("Condition", "condition")
+        self._combo_group.addItem("Genotype", "genotype")
+        self._combo_group.addItem("Condition + Genotype", "condition,genotype")
+        self._combo_group.addItem("Mouse ID + Condition", "mouseId,condition")
+        self._combo_group.addItem("Mouse ID + Genotype", "mouseId,genotype")
+        self._combo_group.addItem("Group", "group")
+        self._combo_group.addItem("Sex", "sex")
+        self._combo_group.addItem("Cohort", "cohort")
+        _fixed(self._combo_group, _FIELD_WIDTH + 30)
+        summary_form.addRow("Compare by", self._combo_group)
         self._color_map = QLineEdit()
         self._color_map.setPlaceholderText("e.g. WT=0, Het=1, control=2")
-        summary_row.addWidget(self._color_map, 1)
-        compute_lay.addLayout(summary_row)
+        self._color_map.setToolTip("Map group labels to tab10 colour indices")
+        summary_form.addRow("Tab10 colors", self._color_map)
+        self._animal_filter = QLineEdit()
+        self._animal_filter.setPlaceholderText("All labels, e.g. mouse1")
+        summary_form.addRow("Focus animal label", self._animal_filter)
+        self._mouse_id_filter = QLineEdit()
+        self._mouse_id_filter.setPlaceholderText("All IDs, e.g. 31098")
+        summary_form.addRow("Focus mouseId", self._mouse_id_filter)
+        summary_card.body.addLayout(summary_form)
+        layout.addWidget(summary_card)
 
-        out_row = QHBoxLayout()
-        out_row.addWidget(QLabel("Output:"))
+        # ── Output destination ─────────────────────────────────────────────
+        out_card = Card("Output destination", "Where per-video tables and summaries are written")
+
+        out_form = _make_form()
         self._combo_output = QComboBox()
         self._combo_output.addItem("Frame-time folders", "time_file_folder")
         self._combo_output.addItem("DLC folders", "dlc_file_folder")
         self._combo_output.addItem("Video folders", "video_file_folder")
         self._combo_output.addItem("Custom folder", "custom")
         self._combo_output.currentIndexChanged.connect(lambda _idx: self._update_ui_state())
-        out_row.addWidget(self._combo_output)
+        _fixed(self._combo_output, _FIELD_WIDTH + 30)
+        out_form.addRow("Output", self._combo_output)
+        out_card.body.addLayout(out_form)
+
+        out_row = QHBoxLayout()
+        out_row.setSpacing(8)
         self._custom_dir = QLineEdit()
         self._custom_dir.setPlaceholderText("Custom output folder...")
         self._custom_dir.textChanged.connect(lambda _text: self._update_ui_state())
@@ -185,50 +249,27 @@ class BatchPanel(QGroupBox):
         self._btn_open_output.setToolTip("Open the selected batch output folder")
         self._btn_open_output.clicked.connect(self._open_output_dir)
         out_row.addWidget(self._btn_open_output)
-        compute_lay.addLayout(out_row)
+        out_card.body.addLayout(out_row)
+        layout.addWidget(out_card)
 
-        group_row = QHBoxLayout()
-        group_row.addWidget(QLabel("Compare by:"))
-        self._combo_group = QComboBox()
-        self._combo_group.addItem("Animal", "animal")
-        self._combo_group.addItem("Mouse ID", "mouseId")
-        self._combo_group.addItem("Condition", "condition")
-        self._combo_group.addItem("Genotype", "genotype")
-        self._combo_group.addItem("Condition + Genotype", "condition,genotype")
-        self._combo_group.addItem("Mouse ID + Condition", "mouseId,condition")
-        self._combo_group.addItem("Mouse ID + Genotype", "mouseId,genotype")
-        self._combo_group.addItem("Group", "group")
-        self._combo_group.addItem("Sex", "sex")
-        self._combo_group.addItem("Cohort", "cohort")
-        group_row.addWidget(self._combo_group)
-        group_row.addWidget(QLabel("Focus animal label:"))
-        self._animal_filter = QLineEdit()
-        self._animal_filter.setPlaceholderText("All labels, e.g. mouse1")
-        group_row.addWidget(self._animal_filter)
-        group_row.addWidget(QLabel("Focus mouseId:"))
-        self._mouse_id_filter = QLineEdit()
-        self._mouse_id_filter.setPlaceholderText("All IDs, e.g. 31098")
-        group_row.addWidget(self._mouse_id_filter)
-        group_row.addStretch()
-        compute_lay.addLayout(group_row)
+        # ── Run + progress ─────────────────────────────────────────────────
+        run_card = Card("Run batch", accent=COLORS["accent"])
 
         self._btn_compute = QPushButton("Process All Loaded Videos")
         self._btn_compute.setToolTip(
             "Compute behavior metrics and social behaviours for every loaded recording row, then export per-video tables"
         )
         self._btn_compute.clicked.connect(self._request_batch)
-        compute_lay.addWidget(self._btn_compute)
+        run_card.body.addWidget(self._btn_compute)
 
         self._progress = QProgressBar()
         self._progress.setVisible(False)
-        compute_lay.addWidget(self._progress)
+        run_card.body.addWidget(self._progress)
 
-        self._status = QLabel("Load recordings to enable batch compute.")
-        self._status.setWordWrap(True)
-        self._status.setStyleSheet("color:#a6adc8; font-size:11px;")
-        compute_lay.addWidget(self._status)
+        self._status = hint("Load recordings to enable batch compute.")
+        run_card.body.addWidget(self._status)
+        layout.addWidget(run_card)
 
-        layout.addWidget(compute_grp)
         self._update_ui_state()
 
     def set_records(self, records: list[dict], *, capture_existing: bool = True) -> None:

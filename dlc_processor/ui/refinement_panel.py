@@ -6,17 +6,20 @@ import logging
 from typing import Optional
 
 import numpy as np
-from PySide6.QtCore import Signal
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QComboBox,
     QGroupBox,
     QHBoxLayout,
     QLabel,
     QPushButton,
+    QSizePolicy,
     QSpinBox,
     QVBoxLayout,
     QWidget,
 )
+
+from shared.ui_kit import COLORS, Card, hint
 
 logger = logging.getLogger(__name__)
 
@@ -36,22 +39,33 @@ class RefinementPanel(QGroupBox):
 
     def _setup_ui(self) -> None:
         layout = QVBoxLayout(self)
-        layout.setSpacing(6)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(12)
 
-        # Current frame display
+        # ── Frame Range card ─────────────────────────────────────────────────
+        range_card = Card(
+            "Frame Range",
+            "Mark a start and end frame to define the correction window.",
+            accent=COLORS["teal"],
+        )
+
+        # Current-frame chip + mark controls.
         frame_row = QHBoxLayout()
-        frame_row.addWidget(QLabel("Current frame:"))
+        frame_row.setSpacing(8)
+        cap_frame = QLabel("Current frame")
+        cap_frame.setObjectName("hint")
         self._lbl_frame = QLabel("—")
-        frame_row.addWidget(self._lbl_frame)
-        frame_row.addStretch()
-        layout.addLayout(frame_row)
+        self._lbl_frame.setStyleSheet(
+            f"color:{COLORS['text']}; font-weight:700; font-size:14px;"
+        )
+        frame_row.addWidget(cap_frame, 0)
+        frame_row.addWidget(self._lbl_frame, 0)
+        frame_row.addStretch(1)
+        range_card.body.addLayout(frame_row)
 
-        # --- Frame Range Selection ---
-        range_group = QGroupBox("Frame Range")
-        range_lay = QVBoxLayout(range_group)
-        range_lay.setSpacing(4)
-
-        range_row = QHBoxLayout()
+        # Mark From / Mark To buttons + live range readout.
+        mark_row = QHBoxLayout()
+        mark_row.setSpacing(8)
         self._btn_from = QPushButton("Mark From")
         self._btn_from.setObjectName("secondary")
         self._btn_from.setToolTip("Set the start of the swap range to the current frame")
@@ -61,52 +75,76 @@ class RefinementPanel(QGroupBox):
         self._btn_to.setToolTip("Set the end of the swap range to the current frame")
         self._btn_to.clicked.connect(self._mark_to_clicked)
         self._lbl_range = QLabel("Range: not set")
-        range_row.addWidget(self._btn_from)
-        range_row.addWidget(self._btn_to)
-        range_row.addWidget(self._lbl_range)
-        range_row.addStretch()
-        range_lay.addLayout(range_row)
+        self._lbl_range.setObjectName("hint")
+        mark_row.addWidget(self._btn_from)
+        mark_row.addWidget(self._btn_to)
+        mark_row.addWidget(self._lbl_range, 1)
+        range_card.body.addLayout(mark_row)
 
+        # Precise numeric From / To entry, kept compact.
         spin_row = QHBoxLayout()
-        spin_row.addWidget(QLabel("From:"))
+        spin_row.setSpacing(8)
+        cap_from = QLabel("From")
+        cap_from.setObjectName("hint")
         self._spin_from = QSpinBox()
         self._spin_from.setRange(0, 10_000_000)
         self._spin_from.setToolTip("Start frame of the range (inclusive)")
-        spin_row.addWidget(self._spin_from)
-        spin_row.addWidget(QLabel("To:"))
+        self._spin_from.setFixedWidth(110)
+        cap_to = QLabel("To")
+        cap_to.setObjectName("hint")
         self._spin_to = QSpinBox()
         self._spin_to.setRange(0, 10_000_000)
         self._spin_to.setToolTip("End frame of the range (inclusive)")
-        spin_row.addWidget(self._spin_to)
-        spin_row.addStretch()
-        range_lay.addLayout(spin_row)
-        layout.addWidget(range_group)
+        self._spin_to.setFixedWidth(110)
+        spin_row.addWidget(cap_from, 0)
+        spin_row.addWidget(self._spin_from, 0)
+        spin_row.addSpacing(8)
+        spin_row.addWidget(cap_to, 0)
+        spin_row.addWidget(self._spin_to, 0)
+        spin_row.addStretch(1)
+        range_card.body.addLayout(spin_row)
 
-        # --- Identity Swap ---
-        swap_group = QGroupBox("Identity Swap")
-        swap_lay = QVBoxLayout(swap_group)
-        swap_lay.setSpacing(4)
+        layout.addWidget(range_card)
+
+        # ── Identity Swap card ───────────────────────────────────────────────
+        swap_card = Card(
+            "Identity Swap",
+            "Exchange two animals' tracks across the selected frame range.",
+            accent=COLORS["accent"],
+        )
 
         swap_row = QHBoxLayout()
-        swap_row.addWidget(QLabel("Swap:"))
+        swap_row.setSpacing(8)
         self._combo_a = QComboBox()
         self._combo_a.setToolTip("First animal to swap")
+        self._combo_a.setMinimumWidth(130)
+        self._combo_a.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        swap_arrow = QLabel("⇄")
+        swap_arrow.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        swap_arrow.setStyleSheet(f"color:{COLORS['text_muted']}; font-size:15px;")
         self._combo_b = QComboBox()
         self._combo_b.setToolTip("Second animal to swap")
-        swap_row.addWidget(self._combo_a)
-        swap_row.addWidget(QLabel("<>"))
-        swap_row.addWidget(self._combo_b)
-        swap_row.addStretch()
-        swap_lay.addLayout(swap_row)
+        self._combo_b.setMinimumWidth(130)
+        self._combo_b.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        swap_row.addWidget(self._combo_a, 1)
+        swap_row.addWidget(swap_arrow, 0)
+        swap_row.addWidget(self._combo_b, 1)
+        swap_card.body.addLayout(swap_row)
 
+        action_row = QHBoxLayout()
+        action_row.setSpacing(8)
         btn_swap = QPushButton("Apply Swap")
         btn_swap.setToolTip("Swap the tracking data of the two selected animals within the frame range")
         btn_swap.clicked.connect(self._apply_swap)
-        swap_lay.addWidget(btn_swap)
+        action_row.addStretch(1)
+        action_row.addWidget(btn_swap, 0)
+        swap_card.body.addLayout(action_row)
 
-        self._lbl_status = QLabel("")
-        swap_lay.addWidget(self._lbl_status)
-        layout.addWidget(swap_group)
+        self._lbl_status = hint("")
+        swap_card.body.addWidget(self._lbl_status)
+
+        layout.addWidget(swap_card)
+        layout.addStretch(1)
 
     def set_animal_dfs(self, dfs: dict) -> None:
         self._animal_dfs = dfs

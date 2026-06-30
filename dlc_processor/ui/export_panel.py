@@ -110,8 +110,16 @@ class ExportPanel(QGroupBox):
         data_lay.addWidget(self._lbl_data)
         layout.addWidget(data_grp)
 
-        video_grp = QGroupBox("Video Export")
+        video_grp = QGroupBox("Behaviour Overlay Video")
         video_lay = QVBoxLayout(video_grp)
+
+        vid_info = QLabel(
+            "Render a broadcast-style overlay: per-animal skeletons plus rounded "
+            "behaviour badges (e.g. “M1: nose-to-nose 0.59”) burned into an .mp4."
+        )
+        vid_info.setWordWrap(True)
+        vid_info.setStyleSheet("color:#9aa0bf; font-size:11px;")
+        video_lay.addWidget(vid_info)
 
         vid_path_row = QHBoxLayout()
         self._vid_path_edit = QLineEdit()
@@ -134,11 +142,38 @@ class ExportPanel(QGroupBox):
         self._chk_vid_behaviors = QCheckBox("Behaviors")
         self._chk_vid_behaviors.setChecked(True)
         self._chk_vid_behaviors.setToolTip("Show active behavior labels on the exported video")
+        self._chk_vid_keypoints = QCheckBox("Keypoints")
+        self._chk_vid_keypoints.setChecked(True)
+        self._chk_vid_keypoints.setToolTip("Draw the keypoint dots on the exported video")
+        self._chk_vid_scores = QCheckBox("Scores")
+        self._chk_vid_scores.setChecked(True)
+        self._chk_vid_scores.setToolTip("Append a per-animal confidence score to each behaviour badge")
         vid_chk_row.addWidget(self._chk_vid_skel)
+        vid_chk_row.addWidget(self._chk_vid_keypoints)
         vid_chk_row.addWidget(self._chk_vid_labels)
         vid_chk_row.addWidget(self._chk_vid_behaviors)
+        vid_chk_row.addWidget(self._chk_vid_scores)
         vid_chk_row.addStretch()
         video_lay.addLayout(vid_chk_row)
+
+        vid_style_row = QHBoxLayout()
+        vid_style_row.addWidget(QLabel("Badges:"))
+        self._combo_vid_badge = QComboBox()
+        self._combo_vid_badge.addItem("Per-animal (M1/M2)", "per_animal")
+        self._combo_vid_badge.addItem("Bottom banner", "banner")
+        self._combo_vid_badge.setToolTip(
+            "Per-animal: behaviour badges follow each animal. Banner: stacked at the bottom centre."
+        )
+        vid_style_row.addWidget(self._combo_vid_badge)
+        vid_style_row.addWidget(QLabel("Identity:"))
+        self._combo_vid_label = QComboBox()
+        self._combo_vid_label.addItem("Mouse (M1/M2)", "mouse")
+        self._combo_vid_label.addItem("Animal name", "id")
+        self._combo_vid_label.addItem("None", "none")
+        self._combo_vid_label.setToolTip("How animals are labelled on the overlay")
+        vid_style_row.addWidget(self._combo_vid_label)
+        vid_style_row.addStretch()
+        video_lay.addLayout(vid_style_row)
 
         fps_row = QHBoxLayout()
         fps_row.addWidget(QLabel("FPS:"))
@@ -837,33 +872,6 @@ class ExportPanel(QGroupBox):
         self._lbl_data.setText(
             f"Exported unified CSV with {len(self._animal_dfs)} animal(s)\n-> {out_dir / 'all_animals.csv'}"
         )
-        return
-
-        per_animal: list[pd.DataFrame] = []
-        total = len(self._animal_dfs) + 1  # +1 for combined
-        self._data_bar.setVisible(True)
-        self._data_bar.setValue(0)
-
-        for i, (aid, df) in enumerate(self._animal_dfs.items()):
-            edf = self._build_export_df(aid, df)
-            edf.to_csv(out_dir / f"{aid}.csv", index=False)
-            prefixed = edf.copy()
-            prefixed.columns = [f"{aid}_{c}" for c in prefixed.columns]
-            per_animal.append(prefixed)
-            pct = int(100.0 * (i + 1) / total)
-            self._data_bar.setValue(pct)
-            self._lbl_data.setText(f"Exporting {aid}… ({i + 1}/{total})")
-            QApplication.processEvents()
-
-        self._lbl_data.setText("Writing combined CSV…")
-        QApplication.processEvents()
-        pd.concat(per_animal, axis=1).to_csv(out_dir / "all_animals.csv", index=False)
-
-        self._data_bar.setValue(100)
-        self._data_bar.setVisible(False)
-        self._lbl_data.setText(
-            f"Exported {len(self._animal_dfs)} animal CSV(s) + combined\n-> {out_dir}"
-        )
 
     def _export_hdf5(self, out_path: Path) -> None:
         from PySide6.QtWidgets import QApplication
@@ -878,25 +886,6 @@ class ExportPanel(QGroupBox):
         self._data_bar.setVisible(False)
         self._lbl_data.setText(
             f"Exported unified HDF5 with {len(self._animal_dfs)} animal(s)\n-> {out_path.name}"
-        )
-        return
-
-        total = len(self._animal_dfs)
-        self._data_bar.setVisible(True)
-        self._data_bar.setValue(0)
-
-        with pd.HDFStore(str(out_path), mode="w") as store:
-            for i, (aid, df) in enumerate(self._animal_dfs.items()):
-                store.put(aid, self._build_export_df(aid, df), format="table")
-                pct = int(100.0 * (i + 1) / max(total, 1))
-                self._data_bar.setValue(pct)
-                self._lbl_data.setText(f"Exporting {aid}… ({i + 1}/{total})")
-                QApplication.processEvents()
-
-        self._data_bar.setValue(100)
-        self._data_bar.setVisible(False)
-        self._lbl_data.setText(
-            f"Exported {len(self._animal_dfs)} animal group(s) to HDF5\n-> {out_path.name}"
         )
 
     def _export_dlc_h5(self, out_path: Path) -> None:
@@ -993,6 +982,12 @@ class ExportPanel(QGroupBox):
             start_frame = 0
             end_frame = 0
 
+        overlay_style = {
+            "draw_keypoints": self._chk_vid_keypoints.isChecked(),
+            "badge_mode": self._combo_vid_badge.currentData() or "per_animal",
+            "show_scores": self._chk_vid_scores.isChecked(),
+            "animal_label_mode": self._combo_vid_label.currentData() or "mouse",
+        }
         self._video_worker = VideoExportWorker(
             video_path=self._video_path,
             output_path=str(out_path),
@@ -1005,6 +1000,7 @@ class ExportPanel(QGroupBox):
             skeleton_edges=self._skeleton_edges,
             start_frame=start_frame,
             end_frame=end_frame,
+            overlay_style=overlay_style,
         )
         self._video_worker.progress.connect(self._video_bar.setValue)
         self._video_worker.status.connect(self._lbl_video.setText)

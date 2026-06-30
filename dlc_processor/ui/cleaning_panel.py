@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
     QListWidget,
     QMenu,
     QPushButton,
+    QSizePolicy,
     QSpinBox,
     QVBoxLayout,
     QWidget,
@@ -26,6 +27,10 @@ from PySide6.QtWidgets import (
 
 from dlc_processor.core.data_cleaner import save_cleaned_h5
 from dlc_processor.ui.calibration_widget import CalibrationDialog
+from shared.ui_kit import COLORS, Card, ToggleChip, hint
+
+# Fixed width for compact numeric inputs so they don't stretch across the card.
+_NUM_W = 110
 
 logger = logging.getLogger(__name__)
 
@@ -56,19 +61,25 @@ class CleaningPanel(QGroupBox):
 
     def _setup_ui(self) -> None:
         layout = QVBoxLayout(self)
-        layout.setSpacing(6)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(12)
 
         # --- Calibration section ---
-        cal_group = QGroupBox("Calibration")
-        cal_layout = QVBoxLayout(cal_group)
-        cal_layout.setSpacing(4)
+        cal_group = Card(
+            "Calibration",
+            "Map video pixels to real-world centimetres.",
+            accent=COLORS["teal"],
+        )
+        cal_layout = cal_group.body
 
         cal_row = QHBoxLayout()
+        cal_row.setSpacing(10)
         self._btn_calibrate = QPushButton("Calibrate\u2026")
         self._btn_calibrate.setToolTip("Draw a known distance on the video to set the px/cm scale")
         self._btn_calibrate.clicked.connect(self._open_calibration)
         cal_row.addWidget(self._btn_calibrate)
         self._lbl_scale = QLabel("Not calibrated")
+        self._lbl_scale.setObjectName("hint")
         cal_row.addWidget(self._lbl_scale, 1)
         cal_layout.addLayout(cal_row)
 
@@ -81,34 +92,40 @@ class CleaningPanel(QGroupBox):
         layout.addWidget(cal_group)
 
         # --- Computed Bodyparts section ---
-        comp_group = QGroupBox("Computed Bodyparts")
-        comp_layout = QVBoxLayout(comp_group)
-        comp_layout.setSpacing(4)
+        comp_group = Card(
+            "Computed Bodyparts",
+            "Derive virtual keypoints from existing ones.",
+            accent=COLORS["green"],
+        )
+        comp_layout = comp_group.body
 
         comp_form = QFormLayout()
-        comp_form.setSpacing(4)
+        comp_form.setSpacing(8)
+        comp_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
 
         self._combo_operation = QComboBox()
         self._combo_operation.addItems(["mean", "midpoint"])
         self._combo_operation.setToolTip("mean: average of all sources; midpoint: halfway between exactly 2 sources")
-        comp_form.addRow("Operation:", self._combo_operation)
+        comp_form.addRow("Operation", self._combo_operation)
 
         self._edit_bp_name = QLineEdit()
         self._edit_bp_name.setPlaceholderText("e.g. body_center")
-        comp_form.addRow("Name:", self._edit_bp_name)
+        comp_form.addRow("Name", self._edit_bp_name)
 
         self._edit_sources = QLineEdit()
         self._edit_sources.setPlaceholderText("e.g. neck, left_hip, right_hip")
-        comp_form.addRow("Sources:", self._edit_sources)
+        comp_form.addRow("Sources", self._edit_sources)
 
         comp_layout.addLayout(comp_form)
 
         comp_btn_row = QHBoxLayout()
+        comp_btn_row.setSpacing(8)
         btn_add_bp = QPushButton("Add")
         btn_add_bp.setToolTip("Create a virtual bodypart computed from the listed sources")
         btn_add_bp.clicked.connect(self._add_computed_bp)
         comp_btn_row.addWidget(btn_add_bp)
         btn_remove_bp = QPushButton("Remove")
+        btn_remove_bp.setObjectName("secondary")
         btn_remove_bp.setToolTip("Remove the selected computed bodypart definition")
         btn_remove_bp.clicked.connect(self._remove_computed_bp)
         comp_btn_row.addWidget(btn_remove_bp)
@@ -122,74 +139,115 @@ class CleaningPanel(QGroupBox):
         layout.addWidget(comp_group)
 
         # --- Cleaning stages ---
-        stages_group = QGroupBox("Cleaning Stages")
-        stages_lay = QVBoxLayout(stages_group)
-        stages_lay.setSpacing(4)
+        stages_group = Card(
+            "Cleaning Stages",
+            "Toggle each stage and tune its parameters.",
+        )
+        stages_lay = stages_group.body
         form = QFormLayout()
-        form.setSpacing(5)
+        form.setSpacing(10)
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
 
-        # Stage 1 — Confidence filter
-        self._chk_conf = QCheckBox("Enable")
-        self._chk_conf.setChecked(True)
-        self._chk_conf.setToolTip("Mark low-confidence frames as missing data for interpolation")
+        # Stage 1 - Confidence filter
+        self._chk_conf = ToggleChip(
+            "Enable",
+            checked=True,
+            tooltip="Mark low-confidence frames as missing data for interpolation",
+        )
         self._spin_conf = QDoubleSpinBox()
         self._spin_conf.setRange(0.0, 1.0)
         self._spin_conf.setSingleStep(0.05)
         self._spin_conf.setValue(0.60)
         self._spin_conf.setDecimals(2)
+        self._spin_conf.setMaximumWidth(_NUM_W)
         self._spin_conf.setToolTip("DLC likelihood threshold (0.6 is typical; lower keeps more data)")
         row1 = QHBoxLayout()
+        row1.setSpacing(8)
         row1.addWidget(self._chk_conf)
-        row1.addWidget(QLabel("Threshold:"))
+        _lbl_conf = QLabel("Threshold:")
+        _lbl_conf.setObjectName("hint")
+        row1.addWidget(_lbl_conf)
         row1.addWidget(self._spin_conf)
         row1.addStretch()
-        form.addRow("Conf. filter:", row1)
+        form.addRow("Conf. filter", row1)
 
-        # Stage 2 — Interpolation
-        self._chk_interp = QCheckBox("Enable")
-        self._chk_interp.setChecked(True)
-        self._chk_interp.setToolTip("Fill NaN gaps with linear interpolation")
+        # Stage 2 - Interpolation
+        self._chk_interp = ToggleChip(
+            "Enable",
+            checked=True,
+            tooltip="Fill NaN gaps with linear interpolation",
+        )
         self._spin_gap = QSpinBox()
         self._spin_gap.setRange(1, 200)
         self._spin_gap.setValue(15)
         self._spin_gap.setSuffix(" frames")
+        self._spin_gap.setMaximumWidth(_NUM_W)
         self._spin_gap.setToolTip("Maximum consecutive missing frames to interpolate (longer gaps stay empty)")
         row2 = QHBoxLayout()
+        row2.setSpacing(8)
         row2.addWidget(self._chk_interp)
-        row2.addWidget(QLabel("Max gap:"))
+        _lbl_gap = QLabel("Max gap:")
+        _lbl_gap.setObjectName("hint")
+        row2.addWidget(_lbl_gap)
         row2.addWidget(self._spin_gap)
         row2.addStretch()
-        form.addRow("Interpolation:", row2)
+        form.addRow("Interpolation", row2)
 
-        # Stage 3 — SG smoothing
-        self._chk_smooth = QCheckBox("Enable")
-        self._chk_smooth.setChecked(True)
-        self._chk_smooth.setToolTip("Apply Savitzky-Golay filter to smooth trajectories")
+        # Stage 3 - SG smoothing
+        self._chk_smooth = ToggleChip(
+            "Enable",
+            checked=True,
+            tooltip="Apply Savitzky-Golay filter to smooth trajectories",
+        )
         self._spin_win = QSpinBox()
         self._spin_win.setRange(3, 101)
         self._spin_win.setSingleStep(2)
         self._spin_win.setValue(11)
+        self._spin_win.setMaximumWidth(_NUM_W)
         self._spin_win.setToolTip("Window size in frames (must be odd; larger = smoother)")
         self._spin_order = QSpinBox()
         self._spin_order.setRange(1, 9)
         self._spin_order.setValue(3)
+        self._spin_order.setMaximumWidth(_NUM_W)
         self._spin_order.setToolTip("Polynomial order (lower = smoother; typically 2-5)")
         row3 = QHBoxLayout()
+        row3.setSpacing(8)
         row3.addWidget(self._chk_smooth)
-        row3.addWidget(QLabel("Window:"))
+        _lbl_win = QLabel("Window:")
+        _lbl_win.setObjectName("hint")
+        row3.addWidget(_lbl_win)
         row3.addWidget(self._spin_win)
-        row3.addWidget(QLabel("Poly order:"))
+        _lbl_poly = QLabel("Poly:")
+        _lbl_poly.setObjectName("hint")
+        row3.addWidget(_lbl_poly)
         row3.addWidget(self._spin_order)
         row3.addStretch()
-        form.addRow("SG smooth:", row3)
+        form.addRow("SG smooth", row3)
 
         stages_lay.addLayout(form)
+
+        stages_btn_row = QHBoxLayout()
+        stages_btn_row.setSpacing(8)
+        btn_apply = QPushButton("Apply Cleaning")
+        btn_apply.setToolTip("Run the enabled cleaning stages: confidence filter, then interpolation, then smoothing")
+        btn_apply.clicked.connect(self._emit_request)
+        stages_btn_row.addWidget(btn_apply)
+        btn_fix = QPushButton("Fix Impossible Conditions")
+        btn_fix.setObjectName("secondary")
+        btn_fix.setToolTip("Detect and fix anatomically impossible poses (e.g. nose behind neck, ears on same side)")
+        btn_fix.clicked.connect(self._emit_impossible_fix_request)
+        stages_btn_row.addWidget(btn_fix)
+        stages_lay.addLayout(stages_btn_row)
+
         layout.addWidget(stages_group)
 
         # --- Cleaning Range ---
-        range_group = QGroupBox("Cleaning Range")
-        range_lay = QVBoxLayout(range_group)
-        range_lay.setSpacing(4)
+        range_group = Card(
+            "Cleaning Range",
+            "Restrict operations to a frame window.",
+            accent=COLORS["amber"],
+        )
+        range_lay = range_group.body
 
         self._chk_use_range = QCheckBox("Apply to selected range only")
         self._chk_use_range.setToolTip("Restrict cleaning to a frame range instead of the entire recording")
@@ -197,26 +255,31 @@ class CleaningPanel(QGroupBox):
         range_lay.addWidget(self._chk_use_range)
 
         range_form = QFormLayout()
-        range_form.setSpacing(4)
+        range_form.setSpacing(8)
+        range_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self._spin_range_start = QSpinBox()
         self._spin_range_start.setRange(0, 999999)
         self._spin_range_start.setValue(0)
         self._spin_range_start.setSuffix(" fr")
+        self._spin_range_start.setMaximumWidth(_NUM_W)
         self._spin_range_start.setEnabled(False)
         self._spin_range_start.valueChanged.connect(self._emit_range_changed)
-        range_form.addRow("Start:", self._spin_range_start)
+        range_form.addRow("Start", self._spin_range_start)
 
         self._spin_range_end = QSpinBox()
         self._spin_range_end.setRange(0, 999999)
         self._spin_range_end.setValue(1000)
         self._spin_range_end.setSuffix(" fr")
+        self._spin_range_end.setMaximumWidth(_NUM_W)
         self._spin_range_end.setEnabled(False)
         self._spin_range_end.valueChanged.connect(self._emit_range_changed)
-        range_form.addRow("End:", self._spin_range_end)
+        range_form.addRow("End", self._spin_range_end)
         range_lay.addLayout(range_form)
 
         range_btn_row = QHBoxLayout()
+        range_btn_row.setSpacing(8)
         self._btn_select_on_plot = QPushButton("Select on Plot")
+        self._btn_select_on_plot.setObjectName("secondary")
         self._btn_select_on_plot.setEnabled(False)
         self._btn_select_on_plot.clicked.connect(
             lambda: self.range_selection_requested.emit()
@@ -224,6 +287,7 @@ class CleaningPanel(QGroupBox):
         range_btn_row.addWidget(self._btn_select_on_plot)
 
         self._btn_select_all = QPushButton("Select All")
+        self._btn_select_all.setObjectName("secondary")
         self._btn_select_all.setEnabled(False)
         self._btn_select_all.setToolTip("Set the range to all frames in the active recording")
         self._btn_select_all.clicked.connect(self._select_all_range)
@@ -234,23 +298,25 @@ class CleaningPanel(QGroupBox):
         layout.addWidget(range_group)
 
         # --- Identity swap ---
-        swap_group = QGroupBox("Identity Swap")
-        swap_lay = QVBoxLayout(swap_group)
-        swap_lay.setSpacing(4)
+        swap_group = Card(
+            "Identity Swap",
+            "Repair mixed-up animal identities.",
+            accent=COLORS["rose"],
+        )
+        swap_lay = swap_group.body
 
         swap_form = QFormLayout()
-        swap_form.setSpacing(4)
+        swap_form.setSpacing(8)
+        swap_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self._combo_swap_a = QComboBox()
         self._combo_swap_b = QComboBox()
-        swap_form.addRow("Mouse A:", self._combo_swap_a)
-        swap_form.addRow("Mouse B:", self._combo_swap_b)
+        swap_form.addRow("Mouse A", self._combo_swap_a)
+        swap_form.addRow("Mouse B", self._combo_swap_b)
         swap_lay.addLayout(swap_form)
 
-        self._lbl_swap_hint = QLabel(
+        self._lbl_swap_hint = hint(
             "Uses the Cleaning Range when enabled; otherwise swaps the whole active recording."
         )
-        self._lbl_swap_hint.setWordWrap(True)
-        self._lbl_swap_hint.setStyleSheet("color:#a6adc8; font-size:11px;")
         swap_lay.addWidget(self._lbl_swap_hint)
 
         self._btn_swap_ids = QPushButton("Swap Mouse Identity")
@@ -264,6 +330,7 @@ class CleaningPanel(QGroupBox):
         swap_lay.addWidget(self._btn_swap_ids)
 
         self._btn_fix_mask_ids = QPushButton("Fix Identity From Masks")
+        self._btn_fix_mask_ids.setObjectName("secondary")
         self._btn_fix_mask_ids.setEnabled(False)
         self._btn_fix_mask_ids.setToolTip(
             "Use COCO mask track IDs as ground truth and repair swapped keypoint identities over the whole recording"
@@ -274,17 +341,21 @@ class CleaningPanel(QGroupBox):
         layout.addWidget(swap_group)
 
         # --- Identity rename ---
-        rename_group = QGroupBox("Identity Labels")
-        rename_lay = QVBoxLayout(rename_group)
-        rename_lay.setSpacing(4)
+        rename_group = Card(
+            "Identity Labels",
+            "Give animals meaningful names.",
+            accent=COLORS["teal"],
+        )
+        rename_lay = rename_group.body
 
         rename_form = QFormLayout()
-        rename_form.setSpacing(4)
+        rename_form.setSpacing(8)
+        rename_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self._combo_rename_from = QComboBox()
-        rename_form.addRow("Current:", self._combo_rename_from)
+        rename_form.addRow("Current", self._combo_rename_from)
         self._edit_rename_to = QLineEdit()
         self._edit_rename_to.setPlaceholderText("e.g. mouse1")
-        rename_form.addRow("Rename to:", self._edit_rename_to)
+        rename_form.addRow("Rename to", self._edit_rename_to)
         rename_lay.addLayout(rename_form)
 
         self._btn_rename_id = QPushButton("Rename Mouse Label")
@@ -295,35 +366,38 @@ class CleaningPanel(QGroupBox):
 
         layout.addWidget(rename_group)
 
-        btn_row = QHBoxLayout()
-        btn_apply = QPushButton("Apply Cleaning")
-        btn_apply.setToolTip("Run the enabled cleaning stages: confidence filter, then interpolation, then smoothing")
-        btn_apply.clicked.connect(self._emit_request)
-        btn_row.addWidget(btn_apply)
-        btn_fix = QPushButton("Fix Impossible Conditions")
-        btn_fix.setToolTip("Detect and fix anatomically impossible poses (e.g. nose behind neck, ears on same side)")
-        btn_fix.clicked.connect(self._emit_impossible_fix_request)
-        btn_row.addWidget(btn_fix)
-        layout.addLayout(btn_row)
+        # --- Session actions ---
+        actions_group = Card(
+            "Session",
+            "Edit tracks, reset, or export the result.",
+        )
+        actions_lay = actions_group.body
 
-        self._btn_reset_cleaning = QPushButton("Reset to Original")
-        self._btn_reset_cleaning.setToolTip("Reload the original DLC tracking and COCO masks for this recording")
-        self._btn_reset_cleaning.clicked.connect(self.reset_cleaning_requested.emit)
-        layout.addWidget(self._btn_reset_cleaning)
-
-        # --- Track Editor ---
         self._btn_track_editor = QPushButton("Track Editor\u2026")
         self._btn_track_editor.setToolTip(
             "Open interactive track editor to visualize, edit, fix and save tracks"
         )
         self._btn_track_editor.clicked.connect(self._open_track_editor)
-        layout.addWidget(self._btn_track_editor)
+        actions_lay.addWidget(self._btn_track_editor)
 
-        # --- Save Cleaned H5 ---
+        actions_row = QHBoxLayout()
+        actions_row.setSpacing(8)
+
+        self._btn_reset_cleaning = QPushButton("Reset to Original")
+        self._btn_reset_cleaning.setObjectName("secondary")
+        self._btn_reset_cleaning.setToolTip("Reload the original DLC tracking and COCO masks for this recording")
+        self._btn_reset_cleaning.clicked.connect(self.reset_cleaning_requested.emit)
+        actions_row.addWidget(self._btn_reset_cleaning)
+
         btn_save = QPushButton("Save Cleaned H5\u2026")
+        btn_save.setObjectName("secondary")
         btn_save.setToolTip("Save the cleaned data as a new HDF5 file")
         btn_save.clicked.connect(self._save_cleaned_h5)
-        layout.addWidget(btn_save)
+        actions_row.addWidget(btn_save)
+        actions_lay.addLayout(actions_row)
+
+        layout.addWidget(actions_group)
+        layout.addStretch()
 
     def _emit_request(self) -> None:
         p = self.params()

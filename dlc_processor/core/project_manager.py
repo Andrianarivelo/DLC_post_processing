@@ -14,6 +14,12 @@ _DLC_EXT = {".h5", ".hdf5", ".csv"}
 _MASK_JSON_SUFFIXES = ("_masks_coco.json", "_mask_polygons.json")
 _TIME_EXT = {".csv", ".txt", ".tsv"}
 
+# LISBET mask+pose export layout (a ``mask_pose`` root with these subfolders).
+_MASKPOSE_SUBDIRS = ("keypoint", "mask", "overlays", "_source_maskpose_combined")
+_MASKPOSE_KEYPOINT_SUFFIXES = ("_keypoints.jsonl.gz", "_keypoints.jsonl")
+_MASKPOSE_MASK_SUFFIXES = ("_mask.jsonl.gz", "_mask.jsonl")
+_MASKPOSE_COMBINED_SUFFIXES = ("_maskpose.jsonl.gz", "_maskpose.jsonl")
+
 
 def scan_folder(folder: Path) -> tuple[list[str], list[str]]:
     """Scan *folder* for video and DLC files, sorted alphabetically.
@@ -66,7 +72,118 @@ def scan_folder_with_sidecars(folder: Path) -> tuple[list[str], list[str], list[
         dlc_files = _merge_paths(lisbet["dlc_files"], dlc_files)
         mask_files = _merge_paths(lisbet["mask_files"], mask_files)
         time_files = _merge_paths(lisbet["time_files"], time_files)
+
+    # LISBET mask+pose export (keypoint/, mask/, overlays/ subfolders).
+    maskpose = discover_maskpose_export(folder)
+    if maskpose["keypoint_files"] or maskpose["mask_files"]:
+        videos = _merge_paths(maskpose["videos"], videos)
+        dlc_files = _merge_paths(maskpose["keypoint_files"], dlc_files)
+        mask_files = _merge_paths(maskpose["mask_files"], mask_files)
     return videos, dlc_files, mask_files, time_files
+
+
+def discover_maskpose_export(folder: Path) -> dict[str, list[str]]:
+    """Discover keypoint/mask JSONL files (and paired videos) in a mask+pose export.
+
+    Accepts the ``mask_pose`` root or any of its subfolders, or a flat folder of
+    ``*_keypoints.jsonl.gz`` / ``*_mask.jsonl.gz`` files. Returns three lists
+    paired by recording order: ``videos`` (clean preprocessed video preferred,
+    overlay otherwise), ``keypoint_files``, and ``mask_files``. Combined
+    ``*_maskpose.jsonl.gz`` files stand in for both pose and masks.
+    """
+    folder = Path(folder)
+    if not folder.is_dir():
+        return {"videos": [], "keypoint_files": [], "mask_files": []}
+
+    root = folder.parent if folder.name in _MASKPOSE_SUBDIRS else folder
+    kp_dir = root / "keypoint"
+    mask_dir = root / "mask"
+    combined_dir = root / "_source_maskpose_combined"
+    overlay_dir = root / "overlays"
+
+    def gather(directory: Path, suffixes: tuple[str, ...]) -> list[str]:
+        if not directory.is_dir():
+            return []
+        return sorted(
+            str(p) for p in directory.iterdir()
+            if p.is_file() and p.name.endswith(suffixes)
+        )
+
+    keypoint_files = gather(kp_dir, _MASKPOSE_KEYPOINT_SUFFIXES)
+    mask_files = gather(mask_dir, _MASKPOSE_MASK_SUFFIXES)
+    combined_files = gather(combined_dir, _MASKPOSE_COMBINED_SUFFIXES)
+
+    # Fall back to a flat folder of JSONL files (e.g. user dropped one subdir).
+    if not keypoint_files and not mask_files and not combined_files:
+        flat = sorted(str(p) for p in root.iterdir() if p.is_file())
+        keypoint_files = [p for p in flat if p.endswith(_MASKPOSE_KEYPOINT_SUFFIXES)]
+        mask_files = [p for p in flat if p.endswith(_MASKPOSE_MASK_SUFFIXES)]
+        combined_files = [p for p in flat if p.endswith(_MASKPOSE_COMBINED_SUFFIXES)]
+
+    # Combined files carry both modalities; use them where a dedicated file is missing.
+    if combined_files:
+        if not keypoint_files:
+            keypoint_files = list(combined_files)
+        if not mask_files:
+            mask_files = list(combined_files)
+
+    if not keypoint_files and not mask_files:
+        return {"videos": [], "keypoint_files": [], "mask_files": []}
+
+    bases = [b for b in (_maskpose_base(Path(p)) for p in keypoint_files) if b]
+    videos = _resolve_maskpose_videos(root, overlay_dir, bases)
+    return {"videos": videos, "keypoint_files": keypoint_files, "mask_files": mask_files}
+
+
+def _maskpose_base(path: Path) -> str | None:
+    """Strip the mask+pose suffix to recover the shared recording base name."""
+    name = path.name
+    for suffix in (
+        _MASKPOSE_KEYPOINT_SUFFIXES
+        + _MASKPOSE_MASK_SUFFIXES
+        + _MASKPOSE_COMBINED_SUFFIXES
+    ):
+        if name.endswith(suffix):
+            return name[: -len(suffix)]
+    return None
+
+
+def _resolve_maskpose_videos(
+    root: Path,
+    overlay_dir: Path,
+    bases: list[str],
+) -> list[str]:
+    """Pair each recording base with a clean video (preferred) or overlay video.
+
+    Returns a list aligned with *bases*, or ``[]`` if videos cannot be resolved
+    for every base (so the caller never produces misaligned blank rows).
+    """
+    if not bases:
+        return []
+    video_dirs = [root.parent / "videos", root / "videos", root.parent]
+
+    clean: list[str] = []
+    for base in bases:
+        found = ""
+        for vdir in video_dirs:
+            candidate = vdir / f"{base}.mp4"
+            if candidate.is_file():
+                found = str(candidate)
+                break
+        clean.append(found)
+
+    overlay = [
+        str(overlay_dir / f"{base}_overlay.mp4")
+        if (overlay_dir / f"{base}_overlay.mp4").is_file() else ""
+        for base in bases
+    ]
+
+    if all(clean):
+        return clean
+    if all(overlay):
+        return overlay
+    merged = [c or o for c, o in zip(clean, overlay)]
+    return merged if all(merged) else []
 
 
 def discover_lisbet_output(path: Path) -> dict[str, list[str]]:

@@ -34,6 +34,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QSpinBox,
     QTableWidget,
     QTableWidgetItem,
@@ -42,6 +43,8 @@ from PySide6.QtWidgets import (
 )
 
 from dlc_processor.core.dlc_loader import get_bodyparts
+from shared.icons import icon_qicon
+from shared.ui_kit import COLORS, Card, hint, section_title
 
 logger = logging.getLogger(__name__)
 
@@ -131,44 +134,60 @@ class ROIPanel(QGroupBox):
     # ── UI ────────────────────────────────────────────────────────────────
 
     def _setup_ui(self) -> None:
+        # Top-level panel: borderless (the side panel already shows the title).
+        self.setObjectName("panelRoot")
+
         layout = QVBoxLayout(self)
-        layout.setSpacing(6)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(12)
 
-        # Shape selection
-        add_group = QGroupBox("Add ROI")
-        add_lay = QVBoxLayout(add_group)
-        add_lay.setSpacing(5)
+        # ── Card 1: ROI creation / drawing tools ─────────────────────────
+        add_card = Card(
+            "Add Region",
+            "Define an ROI by coordinates, or draw it directly on the frame.",
+            accent=COLORS["accent"],
+        )
 
+        # Shape + name on one aligned row, with sensible (not full-width) inputs.
         row1 = QHBoxLayout()
-        row1.addWidget(QLabel("Shape:"))
+        row1.setSpacing(8)
+        row1.addWidget(QLabel("Shape"))
         self._combo_shape = QComboBox()
         self._combo_shape.addItems(["circle", "rectangle", "polygon"])
         self._combo_shape.setToolTip("Circle: centre + radius | Rectangle: centre + width/height | Polygon: list of vertices")
         self._combo_shape.currentTextChanged.connect(self._on_shape_changed)
+        self._combo_shape.setMinimumWidth(118)
+        self._combo_shape.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         row1.addWidget(self._combo_shape)
-        row1.addWidget(QLabel("Name:"))
+        row1.addSpacing(6)
+        row1.addWidget(QLabel("Name"))
         self._edit_name = QLineEdit()
         self._edit_name.setPlaceholderText("ROI name")
-        row1.addWidget(self._edit_name)
-        add_lay.addLayout(row1)
+        row1.addWidget(self._edit_name, 1)
+        add_card.body.addLayout(row1)
 
         # Coordinate form
         form = QFormLayout()
-        form.setSpacing(4)
+        form.setSpacing(8)
+        form.setHorizontalSpacing(12)
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.FieldsStayAtSizeHint)
 
         self._spin_cx = QDoubleSpinBox()
         self._spin_cx.setRange(0, 10000)
         self._spin_cx.setDecimals(0)
         self._spin_cx.setSuffix(" px")
         self._spin_cx.setToolTip("Horizontal centre of the ROI in pixels from the left edge")
-        form.addRow("Centre X:", self._spin_cx)
+        self._spin_cx.setMinimumWidth(130)
+        form.addRow("Centre X", self._spin_cx)
 
         self._spin_cy = QDoubleSpinBox()
         self._spin_cy.setRange(0, 10000)
         self._spin_cy.setDecimals(0)
         self._spin_cy.setSuffix(" px")
         self._spin_cy.setToolTip("Vertical centre of the ROI in pixels from the top edge")
-        form.addRow("Centre Y:", self._spin_cy)
+        self._spin_cy.setMinimumWidth(130)
+        form.addRow("Centre Y", self._spin_cy)
 
         self._spin_radius = QDoubleSpinBox()
         self._spin_radius.setRange(1, 5000)
@@ -176,7 +195,8 @@ class ROIPanel(QGroupBox):
         self._spin_radius.setDecimals(0)
         self._spin_radius.setSuffix(" px")
         self._spin_radius.setToolTip("Circle radius in pixels")
-        self._lbl_radius = QLabel("Radius:")
+        self._spin_radius.setMinimumWidth(130)
+        self._lbl_radius = QLabel("Radius")
         form.addRow(self._lbl_radius, self._spin_radius)
 
         self._spin_width = QDoubleSpinBox()
@@ -185,7 +205,8 @@ class ROIPanel(QGroupBox):
         self._spin_width.setDecimals(0)
         self._spin_width.setSuffix(" px")
         self._spin_width.setToolTip("Rectangle width in pixels")
-        self._lbl_width = QLabel("Width:")
+        self._spin_width.setMinimumWidth(130)
+        self._lbl_width = QLabel("Width")
         form.addRow(self._lbl_width, self._spin_width)
 
         self._spin_height = QDoubleSpinBox()
@@ -194,96 +215,128 @@ class ROIPanel(QGroupBox):
         self._spin_height.setDecimals(0)
         self._spin_height.setSuffix(" px")
         self._spin_height.setToolTip("Rectangle height in pixels")
-        self._lbl_height = QLabel("Height:")
+        self._spin_height.setMinimumWidth(130)
+        self._lbl_height = QLabel("Height")
         form.addRow(self._lbl_height, self._spin_height)
 
         self._edit_points = QLineEdit()
         self._edit_points.setPlaceholderText("x1,y1;x2,y2;x3,y3;...")
         self._edit_points.setToolTip("Polygon vertices as semicolon-separated x,y pairs (minimum 3 points)")
         self._edit_points.setToolTip("Semicolon-separated x,y pairs for polygon vertices")
-        self._lbl_points = QLabel("Points:")
+        self._lbl_points = QLabel("Points")
         form.addRow(self._lbl_points, self._edit_points)
 
-        add_lay.addLayout(form)
+        add_card.body.addLayout(form)
 
+        # Primary action (Add) vs. secondary action (Draw editor).
+        action_row = QHBoxLayout()
+        action_row.setSpacing(8)
         self._btn_add_roi = QPushButton("Add ROI")
+        self._btn_add_roi.setIcon(icon_qicon("map-pin", size=15, color="#ffffff"))
         self._btn_add_roi.setToolTip("Add a region of interest from the coordinates above")
         self._btn_add_roi.clicked.connect(self._add_roi)
-        add_lay.addWidget(self._btn_add_roi)
+        action_row.addWidget(self._btn_add_roi)
 
         self._btn_draw_roi = QPushButton("Draw / Edit on Frame…")
+        self._btn_draw_roi.setObjectName("secondary")
+        self._btn_draw_roi.setIcon(icon_qicon("edit-3", size=15, color=COLORS["text"]))
         self._btn_draw_roi.setToolTip("Open a visual editor to draw ROIs directly on the video frame")
         self._btn_draw_roi.clicked.connect(self._open_roi_editor)
-        add_lay.addWidget(self._btn_draw_roi)
-        layout.addWidget(add_group)
+        action_row.addWidget(self._btn_draw_roi)
+        add_card.body.addLayout(action_row)
+        layout.addWidget(add_card)
 
         # Show/hide based on shape
         self._on_shape_changed("circle")
 
-        # ROI list
-        list_group = QGroupBox("Defined ROIs")
-        list_lay = QVBoxLayout(list_group)
+        # ── Card 2: ROI list / management ────────────────────────────────
+        list_card = Card(
+            "Defined ROIs",
+            "Each ROI is colour-coded to its video overlay.",
+            accent=COLORS["teal"],
+        )
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
-        scroll.setMaximumHeight(140)
+        scroll.setMinimumHeight(110)
+        scroll.setMaximumHeight(160)
         scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        scroll.setStyleSheet(
+            f"QScrollArea {{ background: {COLORS['surface_2']};"
+            f" border: 1px solid {COLORS['border']}; border-radius: 8px; }}"
+        )
         self._roi_list_container = QWidget()
+        self._roi_list_container.setStyleSheet("background: transparent;")
         self._roi_list_layout = QVBoxLayout(self._roi_list_container)
-        self._roi_list_layout.setContentsMargins(0, 0, 0, 0)
-        self._roi_list_layout.setSpacing(2)
+        self._roi_list_layout.setContentsMargins(6, 6, 6, 6)
+        self._roi_list_layout.setSpacing(4)
         self._roi_list_layout.addStretch()
         scroll.setWidget(self._roi_list_container)
-        list_lay.addWidget(scroll)
+        list_card.body.addWidget(scroll)
 
         btn_row = QHBoxLayout()
+        btn_row.addStretch()
         self._btn_clear = QPushButton("Clear All")
+        self._btn_clear.setObjectName("danger")
         self._btn_clear.setToolTip("Remove all defined ROIs")
         self._btn_clear.clicked.connect(self._clear_all)
         btn_row.addWidget(self._btn_clear)
-        btn_row.addStretch()
-        list_lay.addLayout(btn_row)
-        layout.addWidget(list_group)
+        list_card.body.addLayout(btn_row)
+        layout.addWidget(list_card)
 
-        # Analysis
-        analysis_group = QGroupBox("ROI Analysis")
-        analysis_lay = QVBoxLayout(analysis_group)
+        # ── Card 3: Analysis / time-in-zone ──────────────────────────────
+        analysis_card = Card(
+            "Occupancy Analysis",
+            "Measure time, entries, and proximity per ROI and animal.",
+            accent=COLORS["amber"],
+        )
 
-        kp_row = QHBoxLayout()
-        kp_row.addWidget(QLabel("Keypoint:"))
+        kp_form = QFormLayout()
+        kp_form.setSpacing(8)
+        kp_form.setHorizontalSpacing(12)
+        kp_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        kp_form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.FieldsStayAtSizeHint)
+
         self._combo_keypoint = QComboBox()
         self._combo_keypoint.addItem("body_centre")
         self._combo_keypoint.setToolTip("Which bodypart to track for ROI occupancy")
-        kp_row.addWidget(self._combo_keypoint)
+        self._combo_keypoint.setMinimumWidth(160)
+        kp_form.addRow("Keypoint", self._combo_keypoint)
 
         self._spin_proximity = QDoubleSpinBox()
         self._spin_proximity.setRange(0, 500)
         self._spin_proximity.setValue(30)
         self._spin_proximity.setSuffix(" px")
         self._spin_proximity.setToolTip("Distance threshold for 'close to ROI' (0 = in ROI only)")
-        kp_row.addWidget(QLabel("Proximity:"))
-        kp_row.addWidget(self._spin_proximity)
-        analysis_lay.addLayout(kp_row)
+        self._spin_proximity.setMinimumWidth(130)
+        kp_form.addRow("Proximity", self._spin_proximity)
+        analysis_card.body.addLayout(kp_form)
 
         self._btn_analyze = QPushButton("Analyze ROI Occupancy")
+        self._btn_analyze.setIcon(icon_qicon("activity", size=15, color="#ffffff"))
         self._btn_analyze.setToolTip("Compute time spent in each ROI per animal")
         self._btn_analyze.clicked.connect(self._analyze)
-        analysis_lay.addWidget(self._btn_analyze)
+        analysis_card.body.addWidget(self._btn_analyze)
 
-        self._lbl_status = QLabel("")
-        self._lbl_status.setWordWrap(True)
-        self._lbl_status.setStyleSheet("color: #a6adc8; font-size: 11px;")
-        analysis_lay.addWidget(self._lbl_status)
+        self._lbl_status = hint("")
+        analysis_card.body.addWidget(self._lbl_status)
 
+        analysis_card.body.addWidget(section_title("Results"))
         self._results_table = QTableWidget(0, 6)
         self._results_table.setHorizontalHeaderLabels([
             "ROI", "Animal", "Frames In", "Time %", "Entries", "Close %",
         ])
-        self._results_table.setMaximumHeight(200)
+        self._results_table.setMinimumHeight(150)
+        self._results_table.setMaximumHeight(220)
+        self._results_table.verticalHeader().setVisible(False)
+        self._results_table.setAlternatingRowColors(False)
+        self._results_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self._results_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self._results_table.horizontalHeader().setStretchLastSection(True)
-        analysis_lay.addWidget(self._results_table)
+        analysis_card.body.addWidget(self._results_table)
 
-        layout.addWidget(analysis_group)
+        layout.addWidget(analysis_card)
+        layout.addStretch(1)
         self._update_ui_state()
 
     # ── Shape visibility ─────────────────────────────────────────────────
@@ -478,32 +531,54 @@ class ROIPanel(QGroupBox):
 
         for roi in self._rois:
             row_w = QWidget()
+            row_w.setStyleSheet(
+                f"background: {COLORS['surface']};"
+                f" border: 1px solid {COLORS['border_soft']}; border-radius: 7px;"
+            )
             row_lay = QHBoxLayout(row_w)
-            row_lay.setContentsMargins(2, 1, 2, 1)
-            row_lay.setSpacing(4)
+            row_lay.setContentsMargins(8, 5, 6, 5)
+            row_lay.setSpacing(8)
 
             # Color swatch
             swatch = QLabel()
             swatch.setFixedSize(12, 12)
             swatch.setStyleSheet(
-                f"background: {roi.color}; border: 1px solid #555; border-radius: 2px;"
+                f"background: {roi.color}; border: 1px solid {COLORS['border_strong']};"
+                " border-radius: 3px;"
             )
             row_lay.addWidget(swatch)
 
-            info = f"{roi.name} ({roi.shape})"
+            detail = ""
             if roi.shape == "circle":
-                info += f" r={roi.radius:.0f}"
+                detail = f"r={roi.radius:.0f}"
             elif roi.shape == "rectangle":
-                info += f" {roi.width:.0f}x{roi.height:.0f}"
+                detail = f"{roi.width:.0f}×{roi.height:.0f}"
             elif roi.shape == "polygon":
-                info += f" {len(roi.points)} pts"
-            lbl = QLabel(info)
-            lbl.setStyleSheet("color: #cdd6f4; font-size: 11px;")
-            row_lay.addWidget(lbl, 1)
+                detail = f"{len(roi.points)} pts"
+            lbl = QLabel(roi.name)
+            lbl.setStyleSheet(
+                f"color: {COLORS['text']}; font-size: 12px; font-weight: 600; border: none;"
+            )
+            row_lay.addWidget(lbl)
 
-            btn_del = QPushButton("x")
-            btn_del.setFixedSize(20, 20)
-            btn_del.setStyleSheet("font-size: 10px; padding: 0px;")
+            meta = QLabel(f"{roi.shape} · {detail}" if detail else roi.shape)
+            meta.setStyleSheet(
+                f"color: {COLORS['text_muted']}; font-size: 11px; border: none;"
+            )
+            row_lay.addWidget(meta, 1)
+
+            btn_del = QPushButton("×")
+            btn_del.setObjectName("ghost")
+            btn_del.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn_del.setFixedSize(22, 22)
+            btn_del.setToolTip(f"Remove {roi.name}")
+            btn_del.setStyleSheet(
+                "QPushButton {"
+                f" font-size: 14px; padding: 0px; border-radius: 6px;"
+                f" color: {COLORS['text_muted']}; background: transparent; border: none; }}"
+                "QPushButton:hover {"
+                f" color: #ffffff; background: {COLORS['rose']}; }}"
+            )
             btn_del.clicked.connect(lambda checked=False, n=roi.name: self._remove_roi(n))
             row_lay.addWidget(btn_del)
 
@@ -657,29 +732,35 @@ class _ROIDrawDialog(QDialog):
         layout.setSpacing(6)
 
         controls = QHBoxLayout()
-        controls.addWidget(QLabel("Shape:"))
+        controls.setSpacing(8)
+        controls.addWidget(QLabel("Shape"))
         self._combo_shape = QComboBox()
         self._combo_shape.addItems(["rectangle", "circle", "polygon"])
         self._combo_shape.setCurrentText(shape if shape in {"rectangle", "circle", "polygon"} else "rectangle")
+        self._combo_shape.setMinimumWidth(118)
         controls.addWidget(self._combo_shape)
+        controls.addStretch()
 
-        btn_duplicate = QPushButton("Duplicate Selected")
+        btn_duplicate = QPushButton("Duplicate")
+        btn_duplicate.setObjectName("secondary")
         btn_larger = QPushButton("Larger")
+        btn_larger.setObjectName("secondary")
         btn_smaller = QPushButton("Smaller")
-        btn_delete = QPushButton("Delete Selected")
+        btn_smaller.setObjectName("secondary")
+        btn_delete = QPushButton("Delete")
+        btn_delete.setObjectName("danger")
         controls.addWidget(btn_duplicate)
         controls.addWidget(btn_larger)
         controls.addWidget(btn_smaller)
         controls.addWidget(btn_delete)
-        controls.addStretch()
         layout.addLayout(controls)
 
         hint = QLabel(
             "Left click-drag to draw rectangles/circles. For polygons, left click to add points and "
             "double-click to finish. Existing ROIs can be dragged; use Larger/Smaller to resize."
         )
+        hint.setObjectName("hint")
         hint.setWordWrap(True)
-        hint.setStyleSheet("color: #a6adc8; font-size: 11px;")
         layout.addWidget(hint)
 
         self._view = _ROIDrawView(video_path, frame_idx, frame_w, frame_h, rois, parent=self)

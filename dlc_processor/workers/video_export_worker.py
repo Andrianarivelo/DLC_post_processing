@@ -30,6 +30,7 @@ class VideoExportWorker(QThread):
         skeleton_edges: Optional[list[tuple[str, str]]] = None,
         start_frame: int = 0,
         end_frame: Optional[int] = None,
+        overlay_style: Optional[dict] = None,
         parent=None,
     ) -> None:
         super().__init__(parent)
@@ -42,6 +43,9 @@ class VideoExportWorker(QThread):
         self.draw_labels = draw_labels
         self.draw_behaviors = draw_behaviors
         self.skeleton_edges = skeleton_edges
+        # Optional premium-overlay knobs (draw_keypoints, badge_mode,
+        # show_scores, animal_label_mode, outline, line_thickness, kp_radius).
+        self.overlay_style = dict(overlay_style or {})
         self.start_frame = max(0, int(start_frame or 0))
         self.end_frame = None if end_frame is None or int(end_frame or 0) <= 0 else int(end_frame)
         self._abort = False
@@ -93,6 +97,9 @@ class VideoExportWorker(QThread):
         overlay.skeleton_edges = self.skeleton_edges if self.skeleton_edges else list(_SKELETON_EDGES)
         overlay.fill_body = False
         overlay.frame_index_mode = "video"
+        # Apply premium-overlay style overrides (keypoints, badge mode, scores...).
+        for key, value in self.overlay_style.items():
+            setattr(overlay, key, value)
 
         animals = list(self.animal_dfs.keys())
         last_pct = -1

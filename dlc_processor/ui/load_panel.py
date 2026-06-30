@@ -39,6 +39,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from shared.ui_kit import COLORS, Card, divider, section_title
+
 logger = logging.getLogger(__name__)
 
 _DLC_EXT   = {".h5", ".hdf5", ".csv"}
@@ -82,145 +84,157 @@ class LoadPanel(QGroupBox):
 
     # -- UI -------------------------------------------------------------------
 
+    def _file_column(
+        self,
+        title: str,
+        list_widget: QListWidget,
+        add_btn: QPushButton,
+        remove_btn: QPushButton,
+    ) -> QVBoxLayout:
+        """Compose one paired-files column: header, list, and compact add/remove.
+
+        Each column owns its own buttons directly beneath its list so the row
+        never overflows the panel. The add button stretches to fill the column
+        while the remove control stays a fixed, square icon-style button.
+        """
+        col = QVBoxLayout()
+        col.setSpacing(6)
+
+        header = section_title(title)
+        col.addWidget(header)
+
+        list_widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        list_widget.setMinimumHeight(120)
+        list_widget.setMinimumWidth(0)
+        list_widget.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
+        col.addWidget(list_widget, 1)
+
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(5)
+        add_btn.setObjectName("secondary")
+        add_btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        add_btn.setMinimumWidth(0)
+        remove_btn.setObjectName("secondary")
+        remove_btn.setEnabled(False)
+        remove_btn.setFixedWidth(34)
+        remove_btn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        # Use a guaranteed-rendering native icon instead of the U+2212 glyph,
+        # which shows as an empty box in Segoe UI.
+        from PySide6.QtWidgets import QStyle
+        remove_btn.setText("")
+        remove_btn.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_TrashIcon))
+        btn_row.addWidget(add_btn, 1)
+        btn_row.addWidget(remove_btn, 0)
+        col.addLayout(btn_row)
+        return col
+
+    @staticmethod
+    def _info_row(caption: str, value_label: QLabel) -> QHBoxLayout:
+        """A compact label-pair row used inside the Active-recording card."""
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        cap = QLabel(caption)
+        cap.setObjectName("hint")
+        cap.setMinimumWidth(82)
+        cap.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Preferred)
+        cap.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        value_label.setObjectName("hint")
+        value_label.setWordWrap(True)
+        row.addWidget(cap, 0)
+        row.addWidget(value_label, 1)
+        return row
+
     def _setup_ui(self) -> None:
         root = QVBoxLayout(self)
-        root.setSpacing(6)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(12)
 
-        # -- Side-by-side lists -----------------------------------------------
+        # -- Sources card: side-by-side paired lists --------------------------
+        sources = Card(
+            "Sources",
+            "Video, DLC, time, and mask files pair by row position.",
+            accent=COLORS["teal"],
+        )
+
         lists_row = QHBoxLayout()
-        lists_row.setSpacing(8)
+        lists_row.setSpacing(10)
 
-        # Left: Video Files
-        left = QVBoxLayout()
-        left.setSpacing(4)
-        lbl_vid = QLabel("Video Files")
-        lbl_vid.setStyleSheet("color:#a6adc8; font-size:11px; font-weight:600;")
-        left.addWidget(lbl_vid)
-
+        # Video Files
         self._video_list = QListWidget()
-        self._video_list.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        self._video_list.setMinimumHeight(80)
-        self._video_list.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
         self._video_list.currentItemChanged.connect(self._on_video_item_changed)
         self._video_list.itemDoubleClicked.connect(lambda _item: self._on_load_selected())
-        left.addWidget(self._video_list, 1)
-
-        vid_btns = QHBoxLayout()
-        vid_btns.setSpacing(4)
-        self._btn_add_video = QPushButton("+ Add Video")
-        self._btn_add_video.setObjectName("secondary")
+        self._btn_add_video = QPushButton("+ Add")
         self._btn_add_video.setToolTip("Add a video file to pair with the DLC tracking data")
         self._btn_add_video.clicked.connect(self._pick_video)
-        self._btn_remove_video = QPushButton("\u2212 Remove")
-        self._btn_remove_video.setObjectName("secondary")
+        self._btn_remove_video = QPushButton("\u2212")
+        self._btn_remove_video.setToolTip("Remove the selected video from the list")
         self._btn_remove_video.clicked.connect(self._remove_selected_video)
-        self._btn_remove_video.setEnabled(False)
-        vid_btns.addWidget(self._btn_add_video)
-        vid_btns.addWidget(self._btn_remove_video)
-        vid_btns.addStretch()
-        left.addLayout(vid_btns)
+        lists_row.addLayout(
+            self._file_column("Video", self._video_list, self._btn_add_video, self._btn_remove_video),
+            1,
+        )
 
-        lists_row.addLayout(left, 1)
-
-        # Right: DLC Files
-        right = QVBoxLayout()
-        right.setSpacing(4)
-        lbl_dlc = QLabel("DLC Files")
-        lbl_dlc.setStyleSheet("color:#a6adc8; font-size:11px; font-weight:600;")
-        right.addWidget(lbl_dlc)
-
+        # DLC Files
         self._dlc_list = QListWidget()
-        self._dlc_list.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        self._dlc_list.setMinimumHeight(80)
-        self._dlc_list.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
         self._dlc_list.currentItemChanged.connect(self._on_dlc_item_changed)
         self._dlc_list.itemDoubleClicked.connect(lambda _item: self._on_load_selected())
-        right.addWidget(self._dlc_list, 1)
-
-        dlc_btns = QHBoxLayout()
-        dlc_btns.setSpacing(4)
-        self._btn_add_dlc = QPushButton("+ Add DLC File")
-        self._btn_add_dlc.setObjectName("secondary")
-        self._btn_add_dlc.setToolTip("Add a DeepLabCut H5 or CSV tracking file")
+        self._btn_add_dlc = QPushButton("+ Add")
+        self._btn_add_dlc.setToolTip("Add a DeepLabCut H5/CSV or mask+pose keypoints JSONL tracking file")
         self._btn_add_dlc.clicked.connect(self._pick_data)
-        self._btn_remove_dlc = QPushButton("\u2212 Remove")
-        self._btn_remove_dlc.setObjectName("secondary")
+        self._btn_remove_dlc = QPushButton("\u2212")
+        self._btn_remove_dlc.setToolTip("Remove the selected DLC file from the list")
         self._btn_remove_dlc.clicked.connect(self._remove_selected_dlc)
-        self._btn_remove_dlc.setEnabled(False)
-        dlc_btns.addWidget(self._btn_add_dlc)
-        dlc_btns.addWidget(self._btn_remove_dlc)
-        dlc_btns.addStretch()
-        right.addLayout(dlc_btns)
+        lists_row.addLayout(
+            self._file_column("DLC", self._dlc_list, self._btn_add_dlc, self._btn_remove_dlc),
+            1,
+        )
 
-        lists_row.addLayout(right, 1)
-
-        # Time Files: paired by row with video/tracking.
-        time_col = QVBoxLayout()
-        time_col.setSpacing(4)
-        lbl_time_list = QLabel("Time Files")
-        lbl_time_list.setStyleSheet("color:#a6adc8; font-size:11px; font-weight:600;")
-        time_col.addWidget(lbl_time_list)
-
+        # Time Files
         self._time_list = QListWidget()
-        self._time_list.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        self._time_list.setMinimumHeight(80)
-        self._time_list.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
         self._time_list.currentItemChanged.connect(self._on_time_item_changed)
         self._time_list.itemDoubleClicked.connect(lambda _item: self._on_load_selected())
-        time_col.addWidget(self._time_list, 1)
-
-        time_btns = QHBoxLayout()
-        time_btns.setSpacing(4)
-        self._btn_add_time = QPushButton("+ Time")
-        self._btn_add_time.setObjectName("secondary")
+        self._btn_add_time = QPushButton("+ Add")
         self._btn_add_time.setToolTip("Add a frame-time CSV/TXT file paired with this video")
         self._btn_add_time.clicked.connect(self._pick_time_file)
-        self._btn_remove_time = QPushButton("\u2212 Remove")
-        self._btn_remove_time.setObjectName("secondary")
+        self._btn_remove_time = QPushButton("\u2212")
+        self._btn_remove_time.setToolTip("Remove the selected time file from the list")
         self._btn_remove_time.clicked.connect(self._remove_selected_time)
-        self._btn_remove_time.setEnabled(False)
-        time_btns.addWidget(self._btn_add_time)
-        time_btns.addWidget(self._btn_remove_time)
-        time_btns.addStretch()
-        time_col.addLayout(time_btns)
-        lists_row.addLayout(time_col, 1)
+        lists_row.addLayout(
+            self._file_column("Time", self._time_list, self._btn_add_time, self._btn_remove_time),
+            1,
+        )
 
-        # Mask Files: paired by row with video/tracking.
-        mask_col = QVBoxLayout()
-        mask_col.setSpacing(4)
-        lbl_mask_list = QLabel("Mask Files")
-        lbl_mask_list.setStyleSheet("color:#a6adc8; font-size:11px; font-weight:600;")
-        mask_col.addWidget(lbl_mask_list)
-
+        # Mask Files
         self._mask_list = QListWidget()
-        self._mask_list.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        self._mask_list.setMinimumHeight(80)
-        self._mask_list.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
         self._mask_list.currentItemChanged.connect(self._on_mask_item_changed)
         self._mask_list.itemDoubleClicked.connect(lambda _item: self._on_load_selected())
-        mask_col.addWidget(self._mask_list, 1)
-
-        mask_btns = QHBoxLayout()
-        mask_btns.setSpacing(4)
-        self._btn_add_mask = QPushButton("+ Masks")
-        self._btn_add_mask.setObjectName("secondary")
-        self._btn_add_mask.setToolTip("Add a COCO mask JSON paired with this video")
+        self._btn_add_mask = QPushButton("+ Add")
+        self._btn_add_mask.setToolTip("Add a COCO mask JSON or mask+pose masks JSONL paired with this video")
         self._btn_add_mask.clicked.connect(self._pick_masks)
-        self._btn_remove_mask = QPushButton("\u2212 Remove")
-        self._btn_remove_mask.setObjectName("secondary")
+        self._btn_remove_mask = QPushButton("\u2212")
+        self._btn_remove_mask.setToolTip("Remove the selected mask file from the list")
         self._btn_remove_mask.clicked.connect(self._remove_selected_mask)
-        self._btn_remove_mask.setEnabled(False)
-        mask_btns.addWidget(self._btn_add_mask)
-        mask_btns.addWidget(self._btn_remove_mask)
-        mask_btns.addStretch()
-        mask_col.addLayout(mask_btns)
-        lists_row.addLayout(mask_col, 1)
+        lists_row.addLayout(
+            self._file_column("Masks", self._mask_list, self._btn_add_mask, self._btn_remove_mask),
+            1,
+        )
 
-        root.addLayout(lists_row, 1)
+        sources.body.addLayout(lists_row, 1)
 
-        # -- Mapping status ---------------------------------------------------
+        # Drop hint stays visible beneath the lists.
+        self._lbl_drop = QLabel("\u2190 or drag files / folders anywhere on this panel")
+        self._lbl_drop.setObjectName("hint")
+        self._lbl_drop.setStyleSheet(
+            f"color:{COLORS['text_dim']}; font-size:11px; font-style:italic;"
+        )
+        sources.body.addWidget(self._lbl_drop)
+        root.addWidget(sources)
+
+        # -- Navigation card: row stepping + pairing status -------------------
+        nav_card = Card("Active Recording", accent=COLORS["accent"])
+
         nav_row = QHBoxLayout()
-        nav_row.setSpacing(4)
+        nav_row.setSpacing(6)
         self._btn_prev_pair = QPushButton("Previous")
         self._btn_prev_pair.setObjectName("secondary")
         self._btn_prev_pair.setToolTip("Activate the previous loaded recording row")
@@ -232,91 +246,54 @@ class LoadPanel(QGroupBox):
         nav_row.addWidget(self._btn_prev_pair)
         nav_row.addWidget(self._btn_next_pair)
         nav_row.addStretch()
-        root.addLayout(nav_row)
+        nav_card.body.addLayout(nav_row)
 
         self._lbl_mapping = QLabel("No files loaded.")
         self._lbl_mapping.setWordWrap(True)
         self._lbl_mapping.setStyleSheet("color:#a6adc8; font-size:11px;")
-        root.addWidget(self._lbl_mapping)
+        nav_card.body.addWidget(self._lbl_mapping)
 
-        # -- Load Selected button ---------------------------------------------
-        btn_load_row = QHBoxLayout()
-        btn_load_row.setSpacing(4)
+        # Hidden legacy control: kept for API/behaviour compatibility.
         self._btn_load_selected = QPushButton("Load Selected")
         self._btn_load_selected.setObjectName("secondary")
         self._btn_load_selected.setEnabled(False)
         self._btn_load_selected.setToolTip("Activate the selected DLC file and its paired video row")
         self._btn_load_selected.clicked.connect(self._on_load_selected)
         self._btn_load_selected.setVisible(False)
-        btn_load_row.addWidget(self._btn_load_selected)
-        btn_load_row.addStretch()
-        root.addLayout(btn_load_row)
+        nav_card.body.addWidget(self._btn_load_selected)
 
-        # -- Drop hint --------------------------------------------------------
-        self._lbl_drop = QLabel("\u2190 or drag files/folders here")
-        self._lbl_drop.setStyleSheet("color:#45475a; font-size:10px; font-style:italic;")
-        root.addWidget(self._lbl_drop)
+        nav_card.body.addWidget(divider())
 
-        # -- Active file status ------------------------------------------------
         self._lbl_status = QLabel("No file selected.")
         self._lbl_status.setWordWrap(True)
         self._lbl_status.setStyleSheet("color:#a6adc8; font-size:11px;")
-        root.addWidget(self._lbl_status)
+        nav_card.body.addLayout(self._info_row("Active", self._lbl_status))
 
-        # -- Separator --------------------------------------------------------
-        sep = QFrame()
-        sep.setFrameShape(QFrame.Shape.HLine)
-        sep.setStyleSheet("color:#3d3d5c; margin:4px 0;")
-        root.addWidget(sep)
-
-        # -- DLC config -------------------------------------------------------
-        sep_lbl2 = QLabel("DLC Config (optional)")
-        sep_lbl2.setStyleSheet("color:#a6adc8; font-size:11px; font-weight:600; margin-top:6px;")
-        root.addWidget(sep_lbl2)
-
-        row_c = QHBoxLayout()
         self._lbl_config = QLabel("No config selected.")
-        self._lbl_config.setStyleSheet("color:#6c7086; font-size:11px;")
-        self._lbl_config.setWordWrap(True)
+        cfg_row = self._info_row("DLC Config", self._lbl_config)
         btn_cfg = QPushButton("Browse\u2026")
         btn_cfg.setObjectName("secondary")
+        btn_cfg.setToolTip("Choose an optional DLC config.yaml for skeleton metadata")
         btn_cfg.clicked.connect(self._pick_config)
-        row_c.addWidget(self._lbl_config, 1)
-        row_c.addWidget(btn_cfg)
-        root.addLayout(row_c)
+        cfg_row.addWidget(btn_cfg, 0)
+        nav_card.body.addLayout(cfg_row)
 
-        # -- Active sidecar status -------------------------------------------
-        mask_lbl = QLabel("Active Masks")
-        mask_lbl.setStyleSheet("color:#a6adc8; font-size:11px; font-weight:600; margin-top:6px;")
-        root.addWidget(mask_lbl)
-
-        row_m = QHBoxLayout()
         self._lbl_masks = QLabel("No mask file selected.")
-        self._lbl_masks.setStyleSheet("color:#6c7086; font-size:11px;")
-        self._lbl_masks.setWordWrap(True)
-        row_m.addWidget(self._lbl_masks, 1)
-        root.addLayout(row_m)
+        nav_card.body.addLayout(self._info_row("Active Masks", self._lbl_masks))
 
-        sep2 = QFrame()
-        sep2.setFrameShape(QFrame.Shape.HLine)
-        sep2.setStyleSheet("color:#3d3d5c; margin:4px 0;")
-        root.addWidget(sep2)
-
-        time_lbl = QLabel("Active Time")
-        time_lbl.setStyleSheet("color:#a6adc8; font-size:11px; font-weight:600;")
-        time_lbl.setToolTip(
-            "Load timestamps from a CSV/TXT file to replace the default FPS-based time axis.\n"
-            "Useful for syncing with electrophysiology, respiration, or other recordings.\n"
-            "File should have one timestamp (in seconds) per line/row."
-        )
-        root.addWidget(time_lbl)
-
-        row_t = QHBoxLayout()
         self._lbl_time = QLabel("Using FPS-based time.")
-        self._lbl_time.setStyleSheet("color:#6c7086; font-size:11px;")
-        self._lbl_time.setWordWrap(True)
-        row_t.addWidget(self._lbl_time, 1)
-        root.addLayout(row_t)
+        time_row = self._info_row("Active Time", self._lbl_time)
+        time_cap = time_row.itemAt(0).widget()
+        if time_cap is not None:
+            time_cap.setToolTip(
+                "Load timestamps from a CSV/TXT file to replace the default FPS-based time axis.\n"
+                "Useful for syncing with electrophysiology, respiration, or other recordings.\n"
+                "File should have one timestamp (in seconds) per line/row."
+            )
+        nav_card.body.addLayout(time_row)
+
+        root.addWidget(nav_card)
+        root.addStretch(1)
 
     # -- Drag and drop --------------------------------------------------------
 
@@ -345,7 +322,10 @@ class LoadPanel(QGroupBox):
     def _pick_data(self) -> None:
         paths, _ = QFileDialog.getOpenFileNames(
             self, "Open DLC Data File(s)", "",
-            "DLC Result Files (*.h5 *.hdf5 *.csv);;All Files (*)"
+            "Tracking Files (*.h5 *.hdf5 *.csv *.jsonl *.jsonl.gz);;"
+            "DLC Result Files (*.h5 *.hdf5 *.csv);;"
+            "Mask+Pose Keypoints (*_keypoints.jsonl.gz *_maskpose.jsonl.gz);;"
+            "All Files (*)"
         )
         for path in paths:
             if path:
@@ -379,12 +359,16 @@ class LoadPanel(QGroupBox):
                 self.add_time_path(path)
 
     def _pick_masks(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Open COCO Mask JSON", "",
-            "COCO Mask JSON (*.json);;All Files (*)",
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "Open Mask File(s)", "",
+            "Mask Files (*.json *.jsonl *.jsonl.gz);;"
+            "COCO Mask JSON (*.json);;"
+            "Mask+Pose Masks (*_mask.jsonl.gz *_maskpose.jsonl.gz);;"
+            "All Files (*)",
         )
-        if path:
-            self.add_mask_path(path)
+        for path in paths:
+            if path:
+                self.add_mask_path(path)
 
     def _clear_time_file(self) -> None:
         """Clear external timestamps, reverting to FPS-based time."""
@@ -540,8 +524,9 @@ class LoadPanel(QGroupBox):
 
     def _set_mask_at_row(self, idx: int) -> None:
         if 0 <= idx < len(self._mask_paths):
+            video_path = self._video_paths[idx] if idx < len(self._video_paths) else ""
             try:
-                self._set_masks(self._mask_paths[idx])
+                self._set_masks(self._mask_paths[idx], video_path)
             except Exception as exc:
                 logger.exception("Failed to load masks at row %d: %s", idx, exc)
                 self._lbl_masks.setText(f"Error loading masks: {Path(self._mask_paths[idx]).name}: {exc}")
@@ -617,10 +602,21 @@ class LoadPanel(QGroupBox):
             self.time_loaded.emit(None)
             self.error.emit(str(exc))
 
-    def _set_masks(self, path: str) -> None:
+    def _set_masks(self, path: str, video_path: str = "") -> None:
         from dlc_processor.core.mask_loader import CocoMaskStore
+        from dlc_processor.core.maskpose_loader import (
+            build_maskpose_mask_store,
+            is_maskpose_mask_file,
+        )
 
-        store = CocoMaskStore.from_file(path)
+        if is_maskpose_mask_file(path):
+            # Polygon masks need a frame size; take it from the paired video so
+            # they rasterise pixel-aligned with the recording.
+            store = build_maskpose_mask_store(
+                path, video_path=video_path or self._video_path or None
+            )
+        else:
+            store = CocoMaskStore.from_file(path)
         self._mask_store = store
         self._active_mask_path = path
         self._lbl_masks.setText(
@@ -944,6 +940,12 @@ class LoadPanel(QGroupBox):
     def handle_paths(self, paths) -> None:
         """Load dropped or programmatic file/folder paths."""
         from dlc_processor.core.mask_loader import is_coco_mask_json
+        from dlc_processor.core.maskpose_loader import (
+            is_maskpose_combined_file,
+            is_maskpose_jsonl,
+            is_maskpose_keypoint_file,
+            is_maskpose_mask_file,
+        )
         from dlc_processor.core.project_manager import is_metadata_table_file, scan_folder_with_sidecars
         from dlc_processor.core.time_loader import is_frame_time_file
 
@@ -969,6 +971,17 @@ class LoadPanel(QGroupBox):
                 self.metadata_csv_loaded.emit(path)
             elif is_coco_mask_json(p):
                 self.add_mask_path(path)
+            elif is_maskpose_jsonl(p):
+                # Combined files carry both pose and masks -> pair on the same row.
+                if is_maskpose_combined_file(p):
+                    self.add_dlc_path(path)
+                    self.add_mask_path(path)
+                elif is_maskpose_mask_file(p):
+                    self.add_mask_path(path)
+                elif is_maskpose_keypoint_file(p):
+                    self.add_dlc_path(path)
+                else:
+                    logger.debug("Dropped JSONL ignored (not mask+pose): %s", path)
             elif is_frame_time_file(p):
                 self.add_time_path(path)
             elif ext in _VIDEO_EXT:

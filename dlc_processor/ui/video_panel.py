@@ -19,7 +19,6 @@ import numpy as np
 from PySide6.QtCore import QPointF, QRectF, Qt, Signal, Slot
 from PySide6.QtGui import QImage, QKeySequence, QMouseEvent, QPainter, QPixmap, QShortcut, QWheelEvent
 from PySide6.QtWidgets import (
-    QCheckBox,
     QComboBox,
     QGroupBox,
     QHBoxLayout,
@@ -27,11 +26,13 @@ from PySide6.QtWidgets import (
     QMenu,
     QPushButton,
     QSlider,
+    QStyle,
     QVBoxLayout,
     QWidget,
 )
 
 from dlc_processor.core.dlc_loader import get_bodyparts
+from shared.ui_kit import COLORS, ToggleChip
 
 logger = logging.getLogger(__name__)
 
@@ -230,79 +231,109 @@ class VideoPanel(QGroupBox):
         slider_row.addWidget(self._slider, 1)
         layout.addLayout(slider_row)
 
-        # Playback controls row
-        ctrl_row = QHBoxLayout()
-        ctrl_row.setSpacing(4)
+        # \u2500\u2500 Transport row: play controls (left) + zoom controls (right) \u2500\u2500\u2500\u2500\u2500
+        transport = QHBoxLayout()
+        transport.setSpacing(6)
 
-        self._btn_prev = QPushButton("\u23EE")
-        self._btn_prev.setFixedWidth(28)
+        _style = self.style()
+
+        # Light text triangles read clearly on the dark "secondary" buttons;
+        # the Windows standard media icons are dark and vanish on this surface.
+        self._btn_prev = QPushButton("◀")
+        self._btn_prev.setObjectName("secondary")
+        self._btn_prev.setFixedWidth(38)
         self._btn_prev.setToolTip("Previous frame (Left arrow)")
         self._btn_prev.clicked.connect(lambda: self._step_frames(-1))
-        ctrl_row.addWidget(self._btn_prev)
+        transport.addWidget(self._btn_prev)
 
-        self._btn_play = QPushButton("\u25B6 Play")
-        self._btn_play.setObjectName("secondary")
+        self._icon_play = _style.standardIcon(QStyle.StandardPixmap.SP_MediaPlay)
+        self._icon_pause = _style.standardIcon(QStyle.StandardPixmap.SP_MediaPause)
+        self._btn_play = QPushButton("  Play")
+        self._btn_play.setIcon(self._icon_play)
+        self._btn_play.setMinimumWidth(92)
         self._btn_play.setCheckable(True)
         self._btn_play.setToolTip("Play / Pause (Space)")
         self._btn_play.toggled.connect(self._toggle_play)
-        ctrl_row.addWidget(self._btn_play)
+        transport.addWidget(self._btn_play)
 
-        self._btn_next = QPushButton("\u23ED")
-        self._btn_next.setFixedWidth(28)
+        self._btn_next = QPushButton("▶")
+        self._btn_next.setObjectName("secondary")
+        self._btn_next.setFixedWidth(38)
         self._btn_next.setToolTip("Next frame (Right arrow)")
         self._btn_next.clicked.connect(lambda: self._step_frames(1))
-        ctrl_row.addWidget(self._btn_next)
+        transport.addWidget(self._btn_next)
 
         self._combo_speed = QComboBox()
         self._combo_speed.setToolTip("Playback speed")
-        self._combo_speed.setFixedWidth(70)
+        self._combo_speed.setFixedWidth(78)
         for label, val in [("0.25x", 0.25), ("0.5x", 0.5), ("1x", 1.0), ("2x", 2.0), ("4x", 4.0)]:
             self._combo_speed.addItem(label, val)
         self._combo_speed.setCurrentIndex(2)  # 1x
         self._combo_speed.currentIndexChanged.connect(self._on_speed_changed)
-        ctrl_row.addWidget(self._combo_speed)
+        transport.addWidget(self._combo_speed)
 
-        ctrl_row.addSpacing(8)
+        transport.addStretch()
 
-        self._btn_zoom_out = QPushButton("-")
-        self._btn_zoom_out.setFixedWidth(28)
-        self._btn_zoom_out.setToolTip("Zoom out")
+        self._btn_zoom_out = QPushButton("\u2013")
+        self._btn_zoom_out.setObjectName("secondary")
+        self._btn_zoom_out.setFixedWidth(34)
+        self._btn_zoom_out.setToolTip("Zoom out (Ctrl -)")
         self._btn_zoom_out.clicked.connect(self._lbl_frame.zoom_out)
         self._lbl_zoom = QLabel("100%")
-        self._lbl_zoom.setMinimumWidth(44)
+        self._lbl_zoom.setMinimumWidth(48)
         self._lbl_zoom.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._lbl_zoom.setStyleSheet(f"color: {COLORS['text_muted']}; font-size: 11px;")
         self._btn_zoom_in = QPushButton("+")
-        self._btn_zoom_in.setFixedWidth(28)
-        self._btn_zoom_in.setToolTip("Zoom in")
+        self._btn_zoom_in.setObjectName("secondary")
+        self._btn_zoom_in.setFixedWidth(34)
+        self._btn_zoom_in.setToolTip("Zoom in (Ctrl +)")
         self._btn_zoom_in.clicked.connect(self._lbl_frame.zoom_in)
         self._btn_zoom_reset = QPushButton("Fit")
         self._btn_zoom_reset.setObjectName("secondary")
-        self._btn_zoom_reset.setToolTip("Reset zoom")
+        self._btn_zoom_reset.setToolTip("Reset zoom (Ctrl 0)")
         self._btn_zoom_reset.clicked.connect(self._lbl_frame.reset_view)
-        ctrl_row.addWidget(self._btn_zoom_out)
-        ctrl_row.addWidget(self._lbl_zoom)
-        ctrl_row.addWidget(self._btn_zoom_in)
-        ctrl_row.addWidget(self._btn_zoom_reset)
+        transport.addWidget(self._btn_zoom_out)
+        transport.addWidget(self._lbl_zoom)
+        transport.addWidget(self._btn_zoom_in)
+        transport.addWidget(self._btn_zoom_reset)
 
-        ctrl_row.addSpacing(8)
+        # The global button padding (16px sides) would squeeze a single glyph out
+        # of these narrow square buttons, so trim their padding and centre them.
+        for _b in (self._btn_prev, self._btn_next, self._btn_zoom_out, self._btn_zoom_in):
+            _b.setStyleSheet("padding: 5px 0px; font-size: 14px; font-weight: 700;")
+        layout.addLayout(transport)
 
-        self._chk_masks = QCheckBox("Masks")
-        self._chk_masks.setChecked(True)
-        self._chk_masks.setToolTip("Show instance masks when a COCO mask file is loaded")
-        self._chk_skel = QCheckBox("Skeleton")
-        self._chk_skel.setChecked(True)
-        self._chk_skel.setToolTip("Show skeleton overlay (S)")
-        self._chk_labels = QCheckBox("Labels")
-        self._chk_labels.setChecked(True)
-        self._chk_labels.setToolTip("Show bodypart labels")
-        self._chk_behavior = QCheckBox("Behavior")
-        self._chk_behavior.setChecked(True)
-        self._chk_behavior.setToolTip("Show behavior labels on frame")
-        self._chk_skel_only = QCheckBox("Skeleton Only")
-        self._chk_skel_only.setToolTip("Hide video, show skeleton on black background")
-        self._chk_subtitle = QCheckBox("Info")
-        self._chk_subtitle.setChecked(True)
-        self._chk_subtitle.setToolTip("Show frame info and active behaviors as overlay text")
+        # \u2500\u2500 Overlay row: labeled toggle chips + skeleton editor \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+        overlay_row = QHBoxLayout()
+        overlay_row.setSpacing(6)
+        ov_label = QLabel("OVERLAY")
+        ov_label.setStyleSheet(
+            f"color: {COLORS['text_dim']}; font-size: 9px; font-weight: 700;"
+            " letter-spacing: 1.5px;"
+        )
+        overlay_row.addWidget(ov_label)
+
+        self._chk_masks = ToggleChip(
+            "Masks", "layers", checked=True,
+            tooltip="Show instance masks when a COCO mask file is loaded",
+        )
+        self._chk_skel = ToggleChip(
+            "Skeleton", "share-2", checked=True, tooltip="Show skeleton overlay (S)",
+        )
+        self._chk_labels = ToggleChip(
+            "Labels", "tag", checked=True, tooltip="Show animal name labels",
+        )
+        self._chk_behavior = ToggleChip(
+            "Behavior", "activity", checked=True, tooltip="Show behavior badges on the frame",
+        )
+        self._chk_skel_only = ToggleChip(
+            "Skeleton only", "crosshair",
+            tooltip="Hide the video and draw the skeleton on a black background",
+        )
+        self._chk_subtitle = ToggleChip(
+            "Info", "list", checked=True,
+            tooltip="Show frame counter and active behaviors as overlay text (I)",
+        )
         self._chk_subtitle.toggled.connect(
             lambda: self._render_frame(self._current_frame) if self._video_path else None
         )
@@ -311,15 +342,14 @@ class VideoPanel(QGroupBox):
         self._btn_edit_skel.setToolTip("Open the skeleton editor to define bodypart connections")
         self._btn_edit_skel.clicked.connect(self._open_skeleton_editor)
 
-        ctrl_row.addWidget(self._chk_masks)
-        ctrl_row.addWidget(self._chk_skel)
-        ctrl_row.addWidget(self._chk_labels)
-        ctrl_row.addWidget(self._chk_behavior)
-        ctrl_row.addWidget(self._chk_skel_only)
-        ctrl_row.addWidget(self._chk_subtitle)
-        ctrl_row.addWidget(self._btn_edit_skel)
-        ctrl_row.addStretch()
-        layout.addLayout(ctrl_row)
+        for chip in (
+            self._chk_masks, self._chk_skel, self._chk_labels,
+            self._chk_behavior, self._chk_skel_only, self._chk_subtitle,
+        ):
+            overlay_row.addWidget(chip)
+        overlay_row.addStretch()
+        overlay_row.addWidget(self._btn_edit_skel)
+        layout.addLayout(overlay_row)
 
         # Timer for playback
         from PySide6.QtCore import QTimer
@@ -454,7 +484,8 @@ class VideoPanel(QGroupBox):
 
         if not has_video:
             self._btn_play.setChecked(False)
-            self._btn_play.setText("▶ Play")
+            self._btn_play.setText("  Play")
+            self._btn_play.setIcon(self._icon_play)
             self._lbl_pos.setText("0 / 0")
             self._lbl_frame.setText("No video loaded")
             self._lbl_frame.reset_view()
@@ -474,7 +505,6 @@ class VideoPanel(QGroupBox):
 
     def _auto_apply_default_skeleton(self, animal_dfs: dict) -> None:
         """Set skeleton edges from the default template, filtered to available bodyparts."""
-        from dlc_processor.core.dlc_loader import get_bodyparts
         from dlc_processor.workers.overlay_worker import _SKELETON_EDGES, resolve_skeleton_edges
         first_df = next(iter(animal_dfs.values()))
         bps = get_bodyparts(first_df)
@@ -504,10 +534,12 @@ class VideoPanel(QGroupBox):
     def _toggle_play(self, checked: bool) -> None:
         self._playing = checked
         if checked:
-            self._btn_play.setText("⏸ Pause")
+            self._btn_play.setText("  Pause")
+            self._btn_play.setIcon(self._icon_pause)
             self._timer.start()
         else:
-            self._btn_play.setText("▶ Play")
+            self._btn_play.setText("  Play")
+            self._btn_play.setIcon(self._icon_play)
             self._timer.stop()
             # Re-render with smooth scaling on pause
             self._render_frame(self._current_frame)

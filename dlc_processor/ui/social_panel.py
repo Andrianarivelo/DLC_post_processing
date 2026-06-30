@@ -6,7 +6,7 @@ import logging
 from typing import Optional
 
 import numpy as np
-from PySide6.QtCore import Signal
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QSpinBox,
     QTableWidget,
     QTableWidgetItem,
@@ -26,8 +27,22 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from shared.ui_kit import COLORS, Card, hint
+
 # Behaviour colors — matches Gantt chart palette in plot_panel
 logger = logging.getLogger(__name__)
+
+# Form alignment + a fixed, calm field width so numeric inputs sit in a tidy
+# right-aligned column instead of stretching across the whole card.
+_FORM_LABEL_ALIGN = Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+_FORM_ALIGN = Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop
+_FIELD_WIDTH = 110
+
+
+def _compact_field(widget: QWidget) -> None:
+    """Constrain a numeric input to a fixed, premium-looking column width."""
+    widget.setFixedWidth(_FIELD_WIDTH)
+    widget.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
 
 _BEHAVIOR_COLORS = [
     (243, 139, 168),
@@ -77,64 +92,85 @@ class SocialPanel(QGroupBox):
 
     def _setup_ui(self) -> None:
         layout = QVBoxLayout(self)
-        layout.setSpacing(6)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(12)
+
+        # ── Animal pair ───────────────────────────────────────────────────
+        pair_card = Card("Animal pair", "Subject A vs partner B", accent=COLORS["teal"])
 
         pair_row = QHBoxLayout()
-        pair_row.addWidget(QLabel("Animal A:"))
+        pair_row.setSpacing(8)
+        lbl_a = QLabel("A")
+        lbl_a.setStyleSheet(f"color: {COLORS['text_muted']}; font-weight: 700;")
+        pair_row.addWidget(lbl_a)
         self._combo_a = QComboBox()
         self._combo_a.currentIndexChanged.connect(self._update_ui_state)
         self._combo_a.setToolTip("Subject animal — directional behaviours (e.g. 'A follows B') are relative to this animal")
-        pair_row.addWidget(self._combo_a)
-        pair_row.addWidget(QLabel("vs B:"))
+        pair_row.addWidget(self._combo_a, 1)
+        lbl_vs = QLabel("vs B")
+        lbl_vs.setStyleSheet(f"color: {COLORS['text_muted']}; font-weight: 700;")
+        pair_row.addWidget(lbl_vs)
         self._combo_b = QComboBox()
         self._combo_b.currentIndexChanged.connect(self._update_ui_state)
         self._combo_b.setToolTip("Partner animal — the target of directional behaviours")
-        pair_row.addWidget(self._combo_b)
+        pair_row.addWidget(self._combo_b, 1)
         self._btn_swap = QPushButton("Swap")
         self._btn_swap.setObjectName("secondary")
         self._btn_swap.setToolTip("Swap Animal A and Animal B")
         self._btn_swap.clicked.connect(self._swap_animals)
         pair_row.addWidget(self._btn_swap)
-        pair_row.addStretch()
-        layout.addLayout(pair_row)
+        pair_card.body.addLayout(pair_row)
+        layout.addWidget(pair_card)
+
+        # ── Detection thresholds ──────────────────────────────────────────
+        thresh_card = Card("Detection thresholds", "Distance and timing tolerances")
 
         form = QFormLayout()
-        form.setSpacing(5)
+        form.setSpacing(8)
+        form.setHorizontalSpacing(12)
+        form.setLabelAlignment(_FORM_LABEL_ALIGN)
+        form.setFormAlignment(_FORM_ALIGN)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.FieldsStayAtSizeHint)
 
         self._spin_close = QDoubleSpinBox()
         self._spin_close.setRange(0, 500)
         self._spin_close.setValue(25)
         self._spin_close.setSuffix(" px")
         self._spin_close.setToolTip("Max distance for nose-to-nose, nose-to-anogenital, and body contact events (set to 0 for adaptive)")
-        form.addRow("Close contact tol:", self._spin_close)
+        _compact_field(self._spin_close)
+        form.addRow("Close contact tol", self._spin_close)
 
         self._spin_side = QDoubleSpinBox()
         self._spin_side.setRange(1, 500)
         self._spin_side.setValue(50)
         self._spin_side.setSuffix(" px")
         self._spin_side.setToolTip("Max distance for side-by-side and side-reverse detections")
-        form.addRow("Side contact tol:", self._spin_side)
+        _compact_field(self._spin_side)
+        form.addRow("Side contact tol", self._spin_side)
 
         self._spin_follow = QDoubleSpinBox()
         self._spin_follow.setRange(1, 500)
         self._spin_follow.setValue(30)
         self._spin_follow.setSuffix(" px")
         self._spin_follow.setToolTip("Max distance between follower's nose and leader's tail for following detection")
-        form.addRow("Follow tol:", self._spin_follow)
+        _compact_field(self._spin_follow)
+        form.addRow("Follow tol", self._spin_follow)
 
         self._spin_fwin = QSpinBox()
         self._spin_fwin.setRange(1, 120)
         self._spin_fwin.setValue(12)
         self._spin_fwin.setSuffix(" frames")
         self._spin_fwin.setToolTip("Sliding window size for following detection — longer windows require more sustained following")
-        form.addRow("Follow window:", self._spin_fwin)
+        _compact_field(self._spin_fwin)
+        form.addRow("Follow window", self._spin_fwin)
 
         self._spin_median = QSpinBox()
         self._spin_median.setRange(1, 30)
         self._spin_median.setValue(6)
         self._spin_median.setSuffix(" frames")
         self._spin_median.setToolTip("Temporal median filter to remove brief false detections (higher = more smoothing)")
-        form.addRow("Median filter:", self._spin_median)
+        _compact_field(self._spin_median)
+        form.addRow("Median filter", self._spin_median)
 
         self._spin_likelihood = QDoubleSpinBox()
         self._spin_likelihood.setRange(0.0, 1.0)
@@ -142,15 +178,26 @@ class SocialPanel(QGroupBox):
         self._spin_likelihood.setDecimals(2)
         self._spin_likelihood.setValue(0.20)
         self._spin_likelihood.setToolTip("Ignore keypoints below this DLC likelihood when likelihood columns are present")
-        form.addRow("Min likelihood:", self._spin_likelihood)
+        _compact_field(self._spin_likelihood)
+        form.addRow("Min likelihood", self._spin_likelihood)
+
+        thresh_card.body.addLayout(form)
 
         self._chk_use_masks = QCheckBox("Use masks for contact")
         self._chk_use_masks.setChecked(False)
         self._chk_use_masks.setEnabled(False)
         self._chk_use_masks.setToolTip("Use segmentation masks to confirm physical contact; slower on long videos")
-        form.addRow("", self._chk_use_masks)
+        thresh_card.body.addWidget(self._chk_use_masks)
+
+        mask_form = QFormLayout()
+        mask_form.setSpacing(8)
+        mask_form.setHorizontalSpacing(12)
+        mask_form.setLabelAlignment(_FORM_LABEL_ALIGN)
+        mask_form.setFormAlignment(_FORM_ALIGN)
+        mask_form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.FieldsStayAtSizeHint)
 
         mask_row = QHBoxLayout()
+        mask_row.setSpacing(8)
         self._spin_mask_margin = QDoubleSpinBox()
         self._spin_mask_margin.setRange(0.0, 30.0)
         self._spin_mask_margin.setDecimals(1)
@@ -159,6 +206,7 @@ class SocialPanel(QGroupBox):
         self._spin_mask_margin.setSuffix(" %")
         self._spin_mask_margin.setToolTip("Mask edge contact margin as a percent of the selected mask size")
         self._spin_mask_margin.setEnabled(False)
+        _compact_field(self._spin_mask_margin)
         self._btn_mask_calibrate = QPushButton("Calibrate")
         self._btn_mask_calibrate.setObjectName("secondary")
         self._btn_mask_calibrate.setEnabled(False)
@@ -168,64 +216,83 @@ class SocialPanel(QGroupBox):
         )
         mask_row.addWidget(self._spin_mask_margin)
         mask_row.addWidget(self._btn_mask_calibrate)
-        form.addRow("Mask margin:", mask_row)
+        mask_row.addStretch()
+        mask_form.addRow("Mask margin", mask_row)
+        thresh_card.body.addLayout(mask_form)
+        layout.addWidget(thresh_card)
 
-        layout.addLayout(form)
+        # ── Primary actions ───────────────────────────────────────────────
+        actions_card = Card("Run detection", accent=COLORS["accent"])
 
         self._btn_detect = QPushButton("Detect Behaviours")
         self._btn_detect.setToolTip("Run social behaviour detection on the selected animal pair")
         self._btn_detect.clicked.connect(self._detect)
-        layout.addWidget(self._btn_detect)
+        actions_card.body.addWidget(self._btn_detect)
 
         self._btn_process_all = QPushButton("Process All Loaded Videos")
+        self._btn_process_all.setObjectName("secondary")
         self._btn_process_all.setToolTip(
             "Compute framewise behavior metrics and social behaviours for every loaded recording row"
         )
         self._btn_process_all.clicked.connect(self._request_batch_process)
-        layout.addWidget(self._btn_process_all)
+        actions_card.body.addWidget(self._btn_process_all)
 
         self._progress = QProgressBar()
         self._progress.setRange(0, 100)
         self._progress.setVisible(False)
-        layout.addWidget(self._progress)
+        actions_card.body.addWidget(self._progress)
 
-        visible_group = QGroupBox("Visible Behaviours")
-        visible_lay = QVBoxLayout(visible_group)
-        visible_lay.setSpacing(4)
+        self._lbl_status = QLabel("")
+        self._lbl_status.setWordWrap(True)
+        self._lbl_status.setObjectName("hint")
+        actions_card.body.addWidget(self._lbl_status)
+        layout.addWidget(actions_card)
+
+        # ── Visible behaviours ────────────────────────────────────────────
+        visible_group = Card("Visible behaviours", "Toggle which detections appear in the Gantt view")
 
         vis_btn_row = QHBoxLayout()
+        vis_btn_row.setSpacing(8)
         btn_all = QPushButton("All")
+        btn_all.setObjectName("secondary")
         btn_all.clicked.connect(lambda: self._set_all_behavior_checks(True))
         btn_none = QPushButton("None")
+        btn_none.setObjectName("secondary")
         btn_none.clicked.connect(lambda: self._set_all_behavior_checks(False))
         vis_btn_row.addWidget(btn_all)
         vis_btn_row.addWidget(btn_none)
         vis_btn_row.addStretch()
-        visible_lay.addLayout(vis_btn_row)
+        visible_group.body.addLayout(vis_btn_row)
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
-        scroll.setMaximumHeight(120)
+        scroll.setMaximumHeight(140)
         scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        scroll.setStyleSheet("QScrollArea { background: transparent; }")
         container = QWidget()
+        container.setStyleSheet("background: transparent;")
         self._behavior_checks_layout = QVBoxLayout(container)
         self._behavior_checks_layout.setContentsMargins(0, 0, 0, 0)
-        self._behavior_checks_layout.setSpacing(2)
+        self._behavior_checks_layout.setSpacing(4)
         self._behavior_checks_layout.addStretch()
         scroll.setWidget(container)
-        visible_lay.addWidget(scroll)
+        visible_group.body.addWidget(scroll)
         layout.addWidget(visible_group)
 
-        self._lbl_status = QLabel("")
-        self._lbl_status.setWordWrap(True)
-        self._lbl_status.setStyleSheet("color: #a6adc8; font-size: 11px;")
-        layout.addWidget(self._lbl_status)
+        # ── Results ───────────────────────────────────────────────────────
+        results_card = Card("Results", "Per-behaviour frame counts and metrics")
 
         self._table = QTableWidget(0, 4)
         self._table.setHorizontalHeaderLabels(["Behaviour", "Pair", "Frames", "Time %"])
-        self._table.setMaximumHeight(220)
+        self._table.setMinimumHeight(180)
+        self._table.setMaximumHeight(320)
+        self._table.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
         self._table.horizontalHeader().setStretchLastSection(True)
-        layout.addWidget(self._table)
+        self._table.verticalHeader().setVisible(False)
+        results_card.body.addWidget(self._table)
+        results_card.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
+        layout.addWidget(results_card, 1)
+
         self._update_ui_state()
 
     def set_animal_dfs(self, dfs: dict, fps: float = 25.0) -> None:

@@ -28,6 +28,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication, QMainWindow
 
 from dlc_processor.tab_widget import DLCProcessorTab
+from shared.ui_kit import build_app_qss
 
 try:
     from shared.logo import app_icon
@@ -35,61 +36,11 @@ except Exception:  # pragma: no cover - logo is cosmetic only
     app_icon = None
 
 
-# ── Catppuccin-Mocha dark theme ───────────────────────────────────────────────
-DARK_QSS = """
-QMainWindow, QWidget { background: #1e1e2e; color: #cdd6f4;
-    font-family: "Segoe UI", Arial, sans-serif; font-size: 13px; }
-QFrame, QGroupBox { background: #2a2a3e; border: 1px solid #45475a; border-radius: 4px; }
-QGroupBox { font-weight: bold; padding-top: 12px; margin-top: 4px; }
-QGroupBox::title { subcontrol-origin: margin; left: 8px; padding: 0 4px; }
-QLabel { color: #cdd6f4; background: transparent; border: none; }
-QPushButton { background: #7c3aed; color: white; border: none; padding: 5px 14px;
-    border-radius: 5px; font-weight: bold; font-size: 12px; }
-QPushButton:hover { background: #6d28d9; }
-QPushButton:pressed { background: #5b21b6; }
-QPushButton:disabled { background: #45475a; color: #6c7086; }
-QPushButton#secondary { background: #313244; color: #cdd6f4; border: 1px solid #45475a; }
-QPushButton#secondary:hover { background: #45475a; }
-QPushButton#danger { background: #f38ba8; color: #1e1e2e; }
-QLineEdit, QSpinBox, QDoubleSpinBox { background: #313244; color: #cdd6f4;
-    border: 1px solid #45475a; padding: 4px 8px; border-radius: 5px; min-height: 24px; }
-QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus { border-color: #7c3aed; }
-QSpinBox::up-button, QDoubleSpinBox::up-button,
-QSpinBox::down-button, QDoubleSpinBox::down-button { background: #45475a; border: none; width: 16px; }
-QComboBox { background: #313244; color: #cdd6f4; border: 1px solid #45475a;
-    padding: 5px 10px; border-radius: 5px; }
-QComboBox:hover { border-color: #7c3aed; }
-QComboBox QAbstractItemView { background: #313244; color: #cdd6f4;
-    selection-background-color: #7c3aed; border: 1px solid #45475a; }
-QSlider::groove:horizontal { background: #45475a; height: 8px; border-radius: 4px; }
-QSlider::handle:horizontal { background: #cba6f7; width: 16px; height: 16px;
-    margin: -4px 0; border-radius: 8px; }
-QSlider::sub-page:horizontal { background: #7c3aed; border-radius: 4px; }
-QCheckBox { color: #cdd6f4; spacing: 8px; background: transparent; }
-QCheckBox::indicator { width: 16px; height: 16px; border: 2px solid #45475a;
-    border-radius: 3px; background: #313244; }
-QCheckBox::indicator:checked { background: #7c3aed; border-color: #7c3aed; }
-QProgressBar { background: #45475a; border-radius: 4px; text-align: center;
-    color: white; height: 20px; border: none; }
-QProgressBar::chunk { background: #7c3aed; border-radius: 4px; }
-QScrollBar:vertical { background: #1e1e2e; width: 10px; border-radius: 5px; }
-QScrollBar::handle:vertical { background: #45475a; border-radius: 5px; min-height: 20px; }
-QScrollBar::handle:vertical:hover { background: #7c3aed; }
-QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
-QScrollBar:horizontal { background: #1e1e2e; height: 10px; border-radius: 5px; }
-QScrollBar::handle:horizontal { background: #45475a; border-radius: 5px; min-width: 20px; }
-QListWidget { background: #313244; border: 1px solid #45475a; border-radius: 4px; }
-QListWidget::item:selected { background: #7c3aed; color: white; }
-QListWidget::item:hover { background: #45475a; }
-QTableWidget { background: #313244; border: 1px solid #45475a; gridline-color: #45475a; }
-QHeaderView::section { background: #2a2a3e; color: #cdd6f4; padding: 4px;
-    border: 1px solid #45475a; font-weight: bold; }
-QSplitter::handle { background: #45475a; }
-QToolTip { background: #313244; color: #cdd6f4; border: 1px solid #45475a;
-    padding: 4px 8px; border-radius: 4px; }
-QTextEdit, QPlainTextEdit { background: #313244; color: #cdd6f4;
-    border: 1px solid #45475a; border-radius: 4px; }
-"""
+# ── Premium dark theme ────────────────────────────────────────────────────────
+# The full stylesheet lives in shared/ui_kit.py alongside the design tokens and
+# reusable widgets so the look stays consistent across every panel. DARK_QSS is
+# kept as a module-level alias for backwards compatibility.
+DARK_QSS = build_app_qss()
 
 
 def main() -> None:

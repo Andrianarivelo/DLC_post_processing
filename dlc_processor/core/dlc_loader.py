@@ -40,13 +40,17 @@ def load_dlc_file(path: str | Path) -> dict[str, pd.DataFrame]:
     if not path.exists():
         raise FileNotFoundError(f"DLC file not found: {path}")
 
+    if _is_maskpose_keypoints(path):
+        from .maskpose_loader import load_maskpose_keypoints
+        return load_maskpose_keypoints(path)
+
     suffix = path.suffix.lower()
     if suffix in (".h5", ".hdf5"):
         raw = _load_h5(path)
     elif suffix == ".csv":
         raw = _load_csv(path)
     else:
-        raise ValueError(f"Unsupported file type: {suffix!r}. Expected .h5 or .csv.")
+        raise ValueError(f"Unsupported file type: {suffix!r}. Expected .h5, .csv, or mask+pose JSONL.")
 
     n_levels = raw.columns.nlevels
     logger.info("Loaded %s — %d column levels, %d frames", path.name, n_levels, len(raw))
@@ -69,13 +73,17 @@ def detect_animals(path: str | Path) -> list[str]:
     if not path.exists():
         raise FileNotFoundError(f"DLC file not found: {path}")
 
+    if _is_maskpose_keypoints(path):
+        from .maskpose_loader import detect_keypoint_animals
+        return detect_keypoint_animals(path)
+
     suffix = path.suffix.lower()
     if suffix in (".h5", ".hdf5"):
         raw = _load_h5_header(path)
     elif suffix == ".csv":
         raw = _load_csv_header(path)
     else:
-        raise ValueError(f"Unsupported file type: {suffix!r}. Expected .h5 or .csv.")
+        raise ValueError(f"Unsupported file type: {suffix!r}. Expected .h5, .csv, or mask+pose JSONL.")
 
     n_levels = raw.columns.nlevels
     if n_levels >= 4:
@@ -111,6 +119,18 @@ def get_bodyparts(animal_df: pd.DataFrame) -> list[str]:
 
 
 # ── Internal loaders ──────────────────────────────────────────────────────────
+
+def _is_maskpose_keypoints(path: Path) -> bool:
+    """True when *path* is a LISBET mask+pose keypoint/combined JSONL file."""
+    name = path.name.lower()
+    if not name.endswith((".jsonl", ".jsonl.gz")):
+        return False
+    try:
+        from .maskpose_loader import is_maskpose_keypoint_file
+        return is_maskpose_keypoint_file(path)
+    except Exception:
+        return False
+
 
 def _load_h5(path: Path) -> pd.DataFrame:
     try:

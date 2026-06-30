@@ -54,8 +54,29 @@ class CocoMaskStore:
     def from_file(cls, path: str | Path) -> "CocoMaskStore":
         p = Path(path)
         payload = json.loads(p.read_text(encoding="utf-8"))
+        return cls.from_payload(payload, path=p)
+
+    @classmethod
+    def from_payload(
+        cls,
+        payload: dict,
+        path: str | Path,
+        keep_payload: bool = True,
+    ) -> "CocoMaskStore":
+        """Build a store from an in-memory COCO payload dict.
+
+        ``from_file`` reads JSON off disk and delegates here; other importers
+        (e.g. the mask+pose JSONL format) synthesise an equivalent payload and
+        reuse the same decoding, identity-swap, and save logic.
+
+        Set ``keep_payload=False`` for large synthesised payloads: the store
+        keeps only the parsed ``frames`` (the polygon arrays are shared, not
+        copied) and rebuilds a COCO payload on demand at ``save_json`` time,
+        which avoids holding a second full copy of every annotation.
+        """
+        p = Path(path)
         if not isinstance(payload, dict) or "annotations" not in payload:
-            raise ValueError(f"Not a COCO mask JSON: {p}")
+            raise ValueError(f"Not a COCO mask payload: {p}")
 
         image_id_to_frame: dict[int, int] = {}
         image_id_to_size: dict[int, tuple[int, int]] = {}
@@ -102,7 +123,7 @@ class CocoMaskStore:
             path=p,
             frames=frames,
             info=payload.get("info") or {},
-            payload=payload,
+            payload=payload if keep_payload else None,
             image_id_to_frame=image_id_to_frame,
         )
 
@@ -358,7 +379,15 @@ class CocoMaskStore:
         annotations = []
         ann_id = 1
         for frame_idx, items in sorted(self.frames.items()):
-            images.append({"id": int(frame_idx), "frame_index": int(frame_idx)})
+            image: dict[str, Any] = {"id": int(frame_idx), "frame_index": int(frame_idx)}
+            # Polygon segmentations carry no intrinsic size, so persist the
+            # frame height/width here to keep the saved COCO JSON re-loadable.
+            for ann in items:
+                size = getattr(ann, "size", None)
+                if isinstance(size, (list, tuple)) and len(size) >= 2:
+                    image["height"], image["width"] = int(size[0]), int(size[1])
+                    break
+            images.append(image)
             for ann in items:
                 annotations.append(
                     {

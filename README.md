@@ -11,7 +11,7 @@ tidy GLM-ready tables. All offline, all local, all in one window.
 ![Python](https://img.shields.io/badge/Python-3.10%E2%80%933.12-3776ab?logo=python&logoColor=white)
 ![PySide6](https://img.shields.io/badge/GUI-PySide6-41cd52?logo=qt&logoColor=white)
 ![License: MIT](https://img.shields.io/badge/License-MIT-7c3aed.svg)
-![Tests](https://img.shields.io/badge/tests-80%20passing-3fb950)
+![Tests](https://img.shields.io/badge/tests-97%20passing-3fb950)
 
 ![DLC Post-Processing main window](docs/screenshot.png)
 
@@ -41,7 +41,9 @@ glue code:
 - 🎯 **Regions of interest**: draw polygons, get time-in-zone and entries per animal.
 - 🪪 **Identity refinement**: swap, rename, and fix track identities (optionally guided by
   segmentation masks) over any frame range, then write the corrected CSV back out.
-- 🎞️ **Overlay video export** with skeletons, masks, behaviour subtitles, and ROIs burned in.
+- 🎞️ **Behaviour overlay video** in broadcast style: per-animal coloured skeletons plus rounded
+  behaviour badges (e.g. `M1: nose-to-nose 0.59`, `M2: nose-to-nose 0.59`) with confidence scores,
+  burned into an `.mp4`. Masks, name tags, and ROIs optional; per-animal or bottom-banner badges.
 - 📊 **Batch + metadata**: process a whole folder of recordings, attach experimental metadata,
   and export per-group summary figures with statistics (Holm-corrected t-tests and friends).
 - 🧠 **GLM-ready export**: one wide framewise table per recording (`time_s`, every metric, every
@@ -143,7 +145,7 @@ The activity bar on the right drives everything. A typical session flows top to 
 | **Batch / Metadata** | Attach metadata, run folder | Group summaries + statistics figures |
 | **Refine** | Swap / rename / fix IDs | Corrected identities, re-exported CSV |
 | **Infer** | Point at a DLC config | Fresh `.h5` tracking, loaded back in |
-| **Export** | Choose outputs | Overlay video and/or GLM-ready tables |
+| **Export** | Choose outputs | Behaviour overlay video (badges + skeletons) and/or GLM-ready tables |
 
 ---
 
@@ -156,8 +158,8 @@ DLC_post_processing/
 │   ├── core/              # loaders, cleaning, kinematics, social, batch, ROI, export
 │   ├── ui/                # one Qt panel per step of the workflow
 │   ├── workers/           # threaded overlay rendering, inference, video export
-│   └── tests/             # 80 tests covering loading, cleaning, social, batch
-├── shared/                # reusable sidebar layout + SVG icon set
+│   └── tests/             # 97 tests covering loading, cleaning, social, batch, overlay
+├── shared/                # reusable sidebar layout + SVG icon set + premium UI kit
 ├── example_data/          # the real demo clip + tracking
 ├── docs/                  # screenshots
 ├── requirements.txt       # pip dependencies

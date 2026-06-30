@@ -122,6 +122,21 @@ class DLCProcessorTab(SidebarLayout):
         self.video_panel      = VideoPanel()
         self.plot_panel       = PlotPanel()
 
+        # Flatten the slide-out panels: the side-panel header already names each
+        # section, so the panels' own QGroupBox titles/borders were redundant
+        # visual noise. 'panelRoot' styling (see shared/ui_kit) makes them
+        # borderless and title-free.
+        from PySide6.QtWidgets import QGroupBox
+        for _panel in (
+            self.load_panel, self.cleaning_panel, self.kinematics_panel,
+            self.social_panel, self.batch_panel, self.export_panel,
+            self.inference_panel, self.refinement_panel, self.roi_panel,
+        ):
+            if isinstance(_panel, QGroupBox):
+                _panel.setObjectName("panelRoot")
+                _panel.setTitle("")
+                _panel.setFlat(True)
+
         self.add_activity("load",       "file-plus",  "Load",       "Load Files",        self.load_panel)
         self.add_activity("clean",      "sliders",    "Clean",      "Data Cleaning",     self.cleaning_panel)
         self.add_activity("kinematics", "move",       "Kinematics", "Kinematics",        self.kinematics_panel)

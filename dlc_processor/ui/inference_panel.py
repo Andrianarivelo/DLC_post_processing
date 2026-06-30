@@ -8,7 +8,7 @@ import logging
 from pathlib import Path
 from typing import Any, Optional
 
-from PySide6.QtCore import Signal, Slot
+from PySide6.QtCore import Qt, Signal, Slot
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
+    QSizePolicy,
     QSpinBox,
     QDoubleSpinBox,
     QStackedWidget,
@@ -35,28 +36,33 @@ from dlc_processor.core.settings_store import (
     DEFAULT_DLC_CONDA_ENV,
     DEFAULT_DLC_EXECUTION_MODE,
 )
+from shared.ui_kit import COLORS, Card, hint, section_title
 
 logger = logging.getLogger(__name__)
 
 _VIDEO_EXT = {".mp4", ".avi", ".mov", ".mkv", ".wmv", ".webm"}
 
-_SECTION_BTN_QSS = """
-QPushButton {
-    background: transparent;
-    color: #cdd6f4;
-    border: 1px solid #313244;
+_SECTION_BTN_QSS = f"""
+QPushButton {{
+    background: {COLORS['surface_2']};
+    color: {COLORS['text_muted']};
+    border: 1px solid {COLORS['border']};
     border-radius: 8px;
     padding: 8px 10px;
     text-align: left;
     font-weight: 600;
-}
-QPushButton:hover {
-    background: #313244;
-}
-QPushButton:checked {
-    background: #45475a;
-    border-color: #89b4fa;
-}
+    font-size: 12px;
+}}
+QPushButton:hover {{
+    background: {COLORS['elevated']};
+    color: {COLORS['text']};
+    border-color: {COLORS['border_strong']};
+}}
+QPushButton:checked {{
+    background: {COLORS['accent_soft']};
+    color: {COLORS['text']};
+    border-color: {COLORS['accent']};
+}}
 """
 
 
@@ -80,30 +86,36 @@ class InferencePanel(QWidget):
 
     def _setup_ui(self) -> None:
         root = QVBoxLayout(self)
-        root.setSpacing(8)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(12)
 
-        intro = QLabel(
+        intro = hint(
             "Run DeepLabCut inference on one or more videos. The default runtime uses "
             f"the `{DEFAULT_DLC_CONDA_ENV}` conda environment, and a selected checkpoint "
             "file can auto-resolve the DLC 3 shuffle/snapshot settings."
         )
-        intro.setWordWrap(True)
-        intro.setStyleSheet("color:#a6adc8; font-size:11px;")
         root.addWidget(intro)
 
+        # ── Configuration card: section nav + paged settings ─────────────────
+        config_card = Card(
+            "Configuration",
+            "Inputs, runtime, tracking, output, crop and advanced options.",
+            accent=COLORS["accent"],
+        )
+
         body_row = QHBoxLayout()
-        body_row.setSpacing(10)
+        body_row.setSpacing(12)
 
         nav = QVBoxLayout()
         nav.setSpacing(6)
         nav_widget = QWidget()
-        nav_widget.setFixedWidth(104)
+        nav_widget.setFixedWidth(112)
         nav_widget.setLayout(nav)
         body_row.addWidget(nav_widget)
 
         self._pages = QStackedWidget()
         body_row.addWidget(self._pages, 1)
-        root.addLayout(body_row, 1)
+        config_card.body.addLayout(body_row, 1)
 
         self._add_section(nav, "inputs", "Inputs", self._build_inputs_page())
         self._add_section(nav, "runtime", "Runtime", self._build_runtime_page())
@@ -113,15 +125,13 @@ class InferencePanel(QWidget):
         self._add_section(nav, "advanced", "Advanced", self._build_advanced_page())
         nav.addStretch(1)
 
-        sep = QFrame()
-        sep.setFrameShape(QFrame.Shape.HLine)
-        sep.setStyleSheet("color:#313244; margin:4px 0;")
-        root.addWidget(sep)
+        root.addWidget(config_card, 1)
 
-        bottom = QVBoxLayout()
-        bottom.setSpacing(6)
+        # ── Run card: action buttons, progress, status and live log ──────────
+        run_card = Card("Run", accent=COLORS["green"])
 
         btn_row = QHBoxLayout()
+        btn_row.setSpacing(8)
         self._btn_run = QPushButton("Run DLC Inference")
         self._btn_run.clicked.connect(self._run_inference)
         self._btn_abort = QPushButton("Stop")
@@ -131,36 +141,33 @@ class InferencePanel(QWidget):
         btn_row.addWidget(self._btn_run)
         btn_row.addWidget(self._btn_abort)
         btn_row.addStretch()
-        bottom.addLayout(btn_row)
+        run_card.body.addLayout(btn_row)
 
         self._progress = QProgressBar()
         self._progress.setVisible(False)
-        bottom.addWidget(self._progress)
+        run_card.body.addWidget(self._progress)
 
-        self._status = QLabel("Add videos and a DLC config to enable inference.")
-        self._status.setWordWrap(True)
-        self._status.setStyleSheet("color:#a6adc8; font-size:11px;")
-        bottom.addWidget(self._status)
+        self._status = hint("Add videos and a DLC config to enable inference.")
+        run_card.body.addWidget(self._status)
 
         log_row = QHBoxLayout()
-        log_label = QLabel("Run Log")
-        log_label.setStyleSheet("color:#cdd6f4; font-weight:600;")
+        log_label = section_title("Run Log")
         self._btn_clear_log = QPushButton("Clear Log")
         self._btn_clear_log.setObjectName("secondary")
         self._btn_clear_log.clicked.connect(self._clear_log)
         log_row.addWidget(log_label)
         log_row.addStretch(1)
         log_row.addWidget(self._btn_clear_log)
-        bottom.addLayout(log_row)
+        run_card.body.addLayout(log_row)
 
         self._log_output = QPlainTextEdit()
         self._log_output.setReadOnly(True)
         self._log_output.setPlaceholderText("DLC inference activity will appear here.")
         self._log_output.setMinimumHeight(140)
         self._log_output.document().setMaximumBlockCount(400)
-        bottom.addWidget(self._log_output)
+        run_card.body.addWidget(self._log_output)
 
-        root.addLayout(bottom)
+        root.addWidget(run_card)
 
     def _add_section(
         self,
@@ -180,23 +187,49 @@ class InferencePanel(QWidget):
     def _new_page(self, description: str) -> tuple[QWidget, QVBoxLayout]:
         page = QWidget()
         layout = QVBoxLayout(page)
-        layout.setSpacing(8)
-        label = QLabel(description)
-        label.setWordWrap(True)
-        label.setStyleSheet("color:#a6adc8; font-size:10px;")
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(10)
+        label = hint(description)
         layout.addWidget(label)
         return page, layout
+
+    def _browse_row(self, line_edit: QLineEdit, slot) -> QWidget:
+        """Wrap a line edit with a compact secondary 'Browse...' button."""
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(8)
+        row.addWidget(line_edit, 1)
+        btn = QPushButton("Browse...")
+        btn.setObjectName("secondary")
+        btn.clicked.connect(slot)
+        row.addWidget(btn, 0)
+        wrap = QWidget()
+        wrap.setLayout(row)
+        return wrap
+
+    @staticmethod
+    def _tidy_form(form: QFormLayout) -> None:
+        """Give every form a calm, aligned, label-left layout."""
+        form.setContentsMargins(0, 0, 0, 0)
+        form.setHorizontalSpacing(12)
+        form.setVerticalSpacing(10)
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
 
     def _build_inputs_page(self) -> QWidget:
         page, layout = self._new_page(
             "Choose the videos to analyze and the DLC project/checkpoint sources."
         )
 
+        # Video queue ------------------------------------------------------------
+        layout.addWidget(section_title("Video Queue"))
+
         self._video_list = QListWidget()
-        self._video_list.setMinimumHeight(180)
+        self._video_list.setMinimumHeight(160)
         layout.addWidget(self._video_list, 1)
 
         btn_row1 = QHBoxLayout()
+        btn_row1.setSpacing(8)
         btn_add = QPushButton("Add Videos...")
         btn_add.clicked.connect(self._pick_videos)
         btn_folder = QPushButton("Add Folder...")
@@ -204,9 +237,11 @@ class InferencePanel(QWidget):
         btn_folder.clicked.connect(self._pick_video_folder)
         btn_row1.addWidget(btn_add)
         btn_row1.addWidget(btn_folder)
+        btn_row1.addStretch()
         layout.addLayout(btn_row1)
 
         btn_row2 = QHBoxLayout()
+        btn_row2.setSpacing(8)
         self._btn_add_current = QPushButton("Add Active Video")
         self._btn_add_current.setObjectName("secondary")
         self._btn_add_current.clicked.connect(self._add_current_video)
@@ -219,55 +254,34 @@ class InferencePanel(QWidget):
         btn_row2.addWidget(self._btn_add_current)
         btn_row2.addWidget(btn_remove)
         btn_row2.addWidget(btn_clear)
+        btn_row2.addStretch()
         layout.addLayout(btn_row2)
 
-        self._lbl_active_video = QLabel("Active loaded video: none")
-        self._lbl_active_video.setWordWrap(True)
-        self._lbl_active_video.setStyleSheet("color:#a6adc8; font-size:10px;")
+        self._lbl_active_video = hint("Active loaded video: none")
         layout.addWidget(self._lbl_active_video)
 
+        # Project sources --------------------------------------------------------
+        layout.addWidget(section_title("Project Sources"))
+
         form = QFormLayout()
-        form.setContentsMargins(0, 6, 0, 0)
+        self._tidy_form(form)
 
         self._config_edit = QLineEdit()
-        cfg_row = QHBoxLayout()
-        cfg_row.addWidget(self._config_edit, 1)
-        btn_cfg = QPushButton("Browse...")
-        btn_cfg.clicked.connect(self._pick_config)
-        cfg_row.addWidget(btn_cfg)
-        cfg_wrap = QWidget()
-        cfg_wrap.setLayout(cfg_row)
-        form.addRow("DLC config", cfg_wrap)
+        form.addRow("DLC config", self._browse_row(self._config_edit, self._pick_config))
 
         self._checkpoint_edit = QLineEdit()
         self._checkpoint_edit.setPlaceholderText("Optional DLC snapshot (.pt / .pth)")
-        checkpoint_row = QHBoxLayout()
-        checkpoint_row.addWidget(self._checkpoint_edit, 1)
-        btn_checkpoint = QPushButton("Browse...")
-        btn_checkpoint.clicked.connect(self._pick_checkpoint)
-        checkpoint_row.addWidget(btn_checkpoint)
-        checkpoint_wrap = QWidget()
-        checkpoint_wrap.setLayout(checkpoint_row)
-        form.addRow("Checkpoint", checkpoint_wrap)
+        form.addRow("Checkpoint", self._browse_row(self._checkpoint_edit, self._pick_checkpoint))
 
         self._modelprefix_edit = QLineEdit()
         self._modelprefix_edit.setPlaceholderText("Optional model root override")
-        prefix_row = QHBoxLayout()
-        prefix_row.addWidget(self._modelprefix_edit, 1)
-        btn_prefix = QPushButton("Browse...")
-        btn_prefix.clicked.connect(self._pick_modelprefix)
-        prefix_row.addWidget(btn_prefix)
-        prefix_wrap = QWidget()
-        prefix_wrap.setLayout(prefix_row)
-        form.addRow("Model root", prefix_wrap)
+        form.addRow("Model root", self._browse_row(self._modelprefix_edit, self._pick_modelprefix))
 
         layout.addLayout(form)
-        checkpoint_note = QLabel(
+        checkpoint_note = hint(
             "When a checkpoint file is provided, DLC 3 PyTorch shuffle/snapshot "
             "selection is derived from that file automatically."
         )
-        checkpoint_note.setWordWrap(True)
-        checkpoint_note.setStyleSheet("color:#a6adc8; font-size:10px;")
         layout.addWidget(checkpoint_note)
         layout.addStretch(1)
         return page
@@ -278,6 +292,7 @@ class InferencePanel(QWidget):
             f"the `{DEFAULT_DLC_CONDA_ENV}` conda environment."
         )
         form = QFormLayout()
+        self._tidy_form(form)
 
         self._execution_mode = QComboBox()
         self._execution_mode.addItem("Subprocess (Conda/Python)", "subprocess")
@@ -292,14 +307,7 @@ class InferencePanel(QWidget):
 
         self._python_edit = QLineEdit()
         self._python_edit.setPlaceholderText("Optional Python executable override")
-        py_row = QHBoxLayout()
-        py_row.addWidget(self._python_edit, 1)
-        btn_py = QPushButton("Browse...")
-        btn_py.clicked.connect(self._pick_python_exe)
-        py_row.addWidget(btn_py)
-        py_wrap = QWidget()
-        py_wrap.setLayout(py_row)
-        form.addRow("Python exe", py_wrap)
+        form.addRow("Python exe", self._browse_row(self._python_edit, self._pick_python_exe))
 
         self._engine_combo = QComboBox()
         self._engine_combo.addItem("Auto", "auto")
@@ -309,6 +317,7 @@ class InferencePanel(QWidget):
 
         self._videotype_edit = QLineEdit()
         self._videotype_edit.setPlaceholderText("Auto from each video, or e.g. .mp4")
+        self._videotype_edit.setMaximumWidth(260)
         form.addRow("Video type", self._videotype_edit)
 
         self._chk_gpu = QCheckBox("Prefer GPU")
@@ -317,6 +326,7 @@ class InferencePanel(QWidget):
 
         self._gpu_index = QSpinBox()
         self._gpu_index.setRange(0, 16)
+        self._gpu_index.setFixedWidth(110)
         form.addRow("GPU index", self._gpu_index)
 
         self._device_edit = QLineEdit()
@@ -333,6 +343,7 @@ class InferencePanel(QWidget):
         self._batchsize = QSpinBox()
         self._batchsize.setRange(0, 4096)
         self._batchsize.setSpecialValueText("Auto")
+        self._batchsize.setFixedWidth(110)
         form.addRow("Batch size", self._batchsize)
 
         layout.addLayout(form)
@@ -344,6 +355,7 @@ class InferencePanel(QWidget):
             "Configure multi-animal tracking and identity-related post-analysis options."
         )
         form = QFormLayout()
+        self._tidy_form(form)
 
         self._chk_auto_track = QCheckBox("Enable automatic tracking")
         form.addRow("Auto track", self._chk_auto_track)
@@ -351,6 +363,7 @@ class InferencePanel(QWidget):
         self._n_tracks = QSpinBox()
         self._n_tracks.setRange(0, 64)
         self._n_tracks.setSpecialValueText("Auto")
+        self._n_tracks.setFixedWidth(110)
         form.addRow("Track count", self._n_tracks)
 
         self._chk_calibrate = QCheckBox("Run calibration-aware tracking")
@@ -368,17 +381,11 @@ class InferencePanel(QWidget):
             "Choose where DLC writes results and whether newly inferred outputs should be loaded back into the current session."
         )
         form = QFormLayout()
+        self._tidy_form(form)
 
         self._destfolder_edit = QLineEdit()
         self._destfolder_edit.setPlaceholderText("Optional destination folder for DLC outputs")
-        dest_row = QHBoxLayout()
-        dest_row.addWidget(self._destfolder_edit, 1)
-        btn_dest = QPushButton("Browse...")
-        btn_dest.clicked.connect(self._pick_destfolder)
-        dest_row.addWidget(btn_dest)
-        dest_wrap = QWidget()
-        dest_wrap.setLayout(dest_row)
-        form.addRow("Destination", dest_wrap)
+        form.addRow("Destination", self._browse_row(self._destfolder_edit, self._pick_destfolder))
 
         self._chk_save_csv = QCheckBox("Also save CSV")
         self._chk_save_csv.setChecked(True)
@@ -406,31 +413,46 @@ class InferencePanel(QWidget):
             "Optional static and dynamic crop controls. Static crop uses x1/x2/y1/y2; dynamic crop follows the legacy DLC tuple form."
         )
         form = QFormLayout()
+        self._tidy_form(form)
 
         self._chk_crop = QCheckBox("Enable cropping")
         form.addRow("Static crop", self._chk_crop)
 
         self._crop_x1 = QSpinBox()
         self._crop_x1.setRange(0, 100000)
+        self._crop_x1.setFixedWidth(100)
         self._crop_x2 = QSpinBox()
         self._crop_x2.setRange(0, 100000)
+        self._crop_x2.setFixedWidth(100)
         self._crop_y1 = QSpinBox()
         self._crop_y1.setRange(0, 100000)
+        self._crop_y1.setFixedWidth(100)
         self._crop_y2 = QSpinBox()
         self._crop_y2.setRange(0, 100000)
+        self._crop_y2.setFixedWidth(100)
 
         row_x = QHBoxLayout()
+        row_x.setContentsMargins(0, 0, 0, 0)
+        row_x.setSpacing(8)
         row_x.addWidget(self._crop_x1)
-        row_x.addWidget(QLabel("x2"))
+        x2_cap = QLabel("x2")
+        x2_cap.setObjectName("hint")
+        row_x.addWidget(x2_cap)
         row_x.addWidget(self._crop_x2)
+        row_x.addStretch(1)
         x_wrap = QWidget()
         x_wrap.setLayout(row_x)
         form.addRow("x1 / x2", x_wrap)
 
         row_y = QHBoxLayout()
+        row_y.setContentsMargins(0, 0, 0, 0)
+        row_y.setSpacing(8)
         row_y.addWidget(self._crop_y1)
-        row_y.addWidget(QLabel("y2"))
+        y2_cap = QLabel("y2")
+        y2_cap.setObjectName("hint")
+        row_y.addWidget(y2_cap)
         row_y.addWidget(self._crop_y2)
+        row_y.addStretch(1)
         y_wrap = QWidget()
         y_wrap.setLayout(row_y)
         form.addRow("y1 / y2", y_wrap)
@@ -443,11 +465,13 @@ class InferencePanel(QWidget):
         self._dynamic_threshold.setDecimals(2)
         self._dynamic_threshold.setSingleStep(0.05)
         self._dynamic_threshold.setValue(0.50)
+        self._dynamic_threshold.setFixedWidth(110)
         form.addRow("Threshold", self._dynamic_threshold)
 
         self._dynamic_margin = QSpinBox()
         self._dynamic_margin.setRange(0, 500)
         self._dynamic_margin.setValue(10)
+        self._dynamic_margin.setFixedWidth(110)
         form.addRow("Margin", self._dynamic_margin)
 
         layout.addLayout(form)
@@ -459,24 +483,29 @@ class InferencePanel(QWidget):
             "Expose DLC train/eval selection and any extra analyze_videos kwargs not covered by the structured UI."
         )
         form = QFormLayout()
+        self._tidy_form(form)
 
         self._shuffle = QSpinBox()
         self._shuffle.setRange(1, 128)
         self._shuffle.setValue(1)
+        self._shuffle.setFixedWidth(110)
         form.addRow("Shuffle", self._shuffle)
 
         self._trainingsetindex = QSpinBox()
         self._trainingsetindex.setRange(0, 128)
+        self._trainingsetindex.setFixedWidth(110)
         form.addRow("Trainset index", self._trainingsetindex)
 
         self._snapshot_index = QSpinBox()
         self._snapshot_index.setRange(-1, 999999)
         self._snapshot_index.setSpecialValueText("Config default")
+        self._snapshot_index.setFixedWidth(150)
         form.addRow("Snapshot index", self._snapshot_index)
 
         self._detector_snapshot_index = QSpinBox()
         self._detector_snapshot_index.setRange(-1, 999999)
         self._detector_snapshot_index.setSpecialValueText("Config default")
+        self._detector_snapshot_index.setFixedWidth(150)
         form.addRow("Detector snapshot", self._detector_snapshot_index)
 
         self._chk_tfgpu = QCheckBox("TensorFlow GPU inference")
@@ -488,8 +517,7 @@ class InferencePanel(QWidget):
 
         layout.addLayout(form)
 
-        extra_label = QLabel("Extra kwargs JSON")
-        extra_label.setStyleSheet("color:#cdd6f4; font-weight:600;")
+        extra_label = section_title("Extra kwargs JSON")
         layout.addWidget(extra_label)
 
         self._extra_kwargs = QPlainTextEdit()
@@ -502,13 +530,11 @@ class InferencePanel(QWidget):
         self._extra_kwargs.setMinimumHeight(120)
         layout.addWidget(self._extra_kwargs, 1)
 
-        note = QLabel(
+        note = hint(
             "Extra kwargs are merged on top of the structured settings. Use valid JSON "
             "objects only. Unsupported keys are filtered against the DLC version in the "
             "target environment."
         )
-        note.setWordWrap(True)
-        note.setStyleSheet("color:#a6adc8; font-size:10px;")
         layout.addWidget(note)
         return page
 

@@ -59,8 +59,9 @@ glue code:
 ## 📸 More views
 
 **Tracking overlay.** Each animal gets its own colored skeleton, with the active behaviours
-printed right on the frame (here: `A to B body`, `B to A body`, `B oriented to A`, `mask contact`,
-`passive investigation`, mobility states) and an optional segmentation-mask contact check.
+printed right on the frame as rounded, color-coded badges. Here both mice are caught
+nose-to-nose, each badge showing the behaviour and a per-animal confidence score
+(`M1: nose-to-nose 0.97`, `M2: nose-to-nose 0.97`).
 
 ![Tracking overlay close-up](docs/screenshot_video.png)
 
